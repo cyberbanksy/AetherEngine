@@ -590,6 +590,7 @@ public final class Demuxer: @unchecked Sendable {
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
+        BitstreamColorRecovery.repair(ctx)
         logStreams(ctx)
         armGeneratedPTSSuppression(ctx)
     }
