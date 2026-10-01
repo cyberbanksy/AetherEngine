@@ -52,6 +52,20 @@ import MediaPlayer
 @MainActor
 public final class AetherEngine: ObservableObject {
 
+    // MARK: - DVD menus (docs/dvd-menus.md)
+
+    /// Live state of a DVD-Video disc running from its menus (`LoadOptions.dvdStartMode == .menu`):
+    /// whether a menu or a title is on screen, the menu's buttons and highlight, title and chapter.
+    /// nil for every other source and for discs played with `.mainTitle`.
+    @Published public internal(set) var dvdMenu: DVDMenuState?
+    /// The running DVD menu session, nil outside one.
+    var dvdMenuController: DVDMenuController?
+    /// Set while the menu session itself loads / stops a title through the normal pipeline, so that
+    /// load and stop do not tear the session down.
+    var dvdTitleHandoffInProgress = false
+    /// Tests: plays titles somewhere other than the engine pipeline.
+    var dvdTitleHostOverride: DVDTitleHost?
+
     // MARK: - Public State
 
     @Published public internal(set) var state: PlaybackState = .idle {
@@ -2272,7 +2286,7 @@ public final class AetherEngine: ObservableObject {
     /// HDR HEVC to route via the master playlist on a non-DV panel and surface "Öffnen fehlgeschlagen".
     /// Read by AetherEngine+FrameExtractor. Every internal reroute (#154, #168, #199, #246, #268) reaches
     /// the published route through this property, so its writes feed `recomputeVideoRoute` (#321).
-    private(set) var loadedOptions: LoadOptions = .init() {
+    internal(set) var loadedOptions: LoadOptions = .init() {
         didSet { recomputeVideoRoute(); recomputeAudioDelivery() }
     }
 
@@ -4113,6 +4127,14 @@ public final class AetherEngine: ObservableObject {
         var source = source
         var startPosition = startPosition
         var options = options
+        // DVD menus: a DVD-Video image loaded with `.menu` runs from its first-play PGC on the DVD menu
+        // player; its titles come back through here as custom sources with the hand-off flag set.
+        if !dvdTitleHandoffInProgress {
+            tearDownDVDMenuSession()
+            if options.dvdStartMode == .menu, startDVDMenuSessionIfPossible(source: source, options: options) {
+                return nil
+            }
+        }
         options = Self.applyingSharedOutputRole(options)
         SharedOutputCoordinator.shared.join(ObjectIdentifier(self), role: options.sharedOutputRole, tag: logTag, owner: self)
         // #436: a speed the host set belongs to the item it was set on. The rebuilds a session makes
@@ -6581,6 +6603,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
+        if !dvdTitleHandoffInProgress { tearDownDVDMenuSession() }
         cancelPendingAudioSelection()
         releaseHeldPicture(reason: "stop")
         nextLoadRequestsInPlaceItemHandover = false

@@ -89,6 +89,10 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// and its audio are fine, and the same load succeeds once space is freed. A host should free
     /// its own caches or ask the user to, not demote to another player.
     public static let storageExhausted = PlaybackErrorKind(rawValue: "storageExhausted")
+    /// A DVD menu session (`LoadOptions.dvdStartMode == .menu`) hit navigation it cannot follow: a
+    /// command loop, a missing program chain, unreadable title sectors. The disc itself may still play
+    /// as `.mainTitle` (Skip to Movie), which is the host's fallback.
+    public static let dvdNavigationFailed = PlaybackErrorKind(rawValue: "dvdNavigationFailed")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

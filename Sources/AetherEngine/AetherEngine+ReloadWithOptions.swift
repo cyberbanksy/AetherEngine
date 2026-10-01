@@ -303,6 +303,7 @@ enum SessionOptionCorrection {
         "sequentialOrigin",
         "heldSourceConnection",
         "sharedOutputRole",
+        "dvdStartMode",
     ]
 
     /// The fields a running SESSION owns, which a correction may name and the rebuild then decides
@@ -342,6 +343,7 @@ enum SessionOptionCorrection {
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
         }
+        if proposed.dvdStartMode != current.dvdStartMode { refused.append("dvdStartMode") }
         return refused
     }
 
@@ -455,6 +457,6 @@ enum SessionOptionCorrection {
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "sharedOutputRole", "dvdStartMode", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }
