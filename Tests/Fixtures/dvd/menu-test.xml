@@ -1,0 +1,36 @@
+<dvdauthor dest="DVD" jumppad="0">
+  <vmgm>
+    <fpc>g1 = 1; jump vmgm menu 1;</fpc>
+    <menus>
+      <video format="ntsc" aspect="4:3"/>
+      <pgc entry="title" pause="inf">
+        <vob file="vmgm_menu.mpg" pause="inf"/>
+        <button name="b1">jump title 1;</button>
+        <button name="b2">jump titleset 1 menu;</button>
+        <button name="b3">g2 = 7; jump title 2;</button>
+      </pgc>
+    </menus>
+  </vmgm>
+  <titleset>
+    <menus>
+      <video format="ntsc" aspect="4:3"/>
+      <pgc entry="root" pause="inf">
+        <vob file="vtsm_menu.mpg" pause="inf"/>
+        <button name="b1">jump title 1 chapter 1;</button>
+        <button name="b2">jump title 1 chapter 2;</button>
+        <button name="b3">jump vmgm menu 1;</button>
+      </pgc>
+    </menus>
+    <titles>
+      <video format="ntsc" aspect="4:3"/>
+      <pgc>
+        <vob file="title1.mpg" chapters="0,0:00:01"/>
+        <post>call vmgm menu 1;</post>
+      </pgc>
+      <pgc>
+        <vob file="title2.mpg"/>
+        <post>if (g2 == 7) call menu; call vmgm menu 1;</post>
+      </pgc>
+    </titles>
+  </titleset>
+</dvdauthor>
