@@ -208,6 +208,11 @@ struct DVDVirtualMachine: Sendable {
         return action
     }
 
+    /// The PGC the state currently points at (its palette, stream control and cells), if any.
+    func currentPGC(_ state: DVDVMState) -> DVDPGC? {
+        Executor(nav: navigation, s: state).pgc
+    }
+
     /// The user operations prohibited right now (title + PGC masks, plus the current VOBU's mask).
     func prohibitedOperations(_ state: DVDVMState, vobu: DVDUserOperations = []) -> DVDUserOperations {
         Executor(nav: navigation, s: state).prohibited(vobu: vobu)

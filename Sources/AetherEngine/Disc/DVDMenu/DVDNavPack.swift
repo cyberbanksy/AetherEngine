@@ -35,7 +35,7 @@ struct DVDButton: Equatable, Sendable {
     let x0: Int, x1: Int, y0: Int, y1: Int
     let autoAction: Bool
     let up: Int, down: Int, left: Int, right: Int
-    let command: DVDCommand
+    var command: DVDCommand
 
     init?(number: Int, raw: [UInt8]) {
         guard raw.count == 18 else { return nil }
