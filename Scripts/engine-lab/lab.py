@@ -247,7 +247,8 @@ def score(entry, r):
         seeks = r.get("seeks") or []
         if not seeks:
             s["seek_latency"] = s["seek_continuity"] = "N/A"
-            if not live and r.get("seeksSkipped") not in ("live", "disabled") and (r.get("probe", {}).get("duration") or 0) > 10:
+            dur = max(r.get("probe", {}).get("duration") or 0, (r.get("oracle") or {}).get("duration") or 0)
+            if not live and r.get("seeksSkipped") not in ("live", "disabled") and dur > 10:
                 s["seek_latency"] = "FAIL"
                 why["seek_latency"] = f"no seeks ran ({r.get('seeksSkipped')})"
         else:

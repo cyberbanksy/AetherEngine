@@ -1269,9 +1269,9 @@
    "kind": "quirk",
    "quirk": "range-ignored",
    "target": "g-mp4-moov-end",
-   "expect": "play",
+   "expect": "no-wedge",
    "license": "local fixture",
-   "notes": "Range ignored on a moov-at-end MP4"
+   "notes": "Range ignored on a moov-at-end MP4: only a full forward read reaches the moov, so the engine must fail fast and typed (or play), never hang"
   },
   {
    "id": "q-range-ignored-mkv",
