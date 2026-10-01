@@ -14,4 +14,18 @@ final class SoftwareEndOfMediaSeekTests: XCTestCase {
     func testSeekDuringTheTailDrainKeepsTheLoopRunning() {
         XCTAssertFalse(SoftwarePlaybackHost.endOfMediaStands(generationAtRead: 7, generationNow: 8))
     }
+
+    // MARK: - Published -> source axis (engine lab: broadcast TS with a non-zero PTS origin)
+
+    /// `ff-h264-paff-ts`: PTS start at 23021.8 s. A seek to published 7.56 s must reposition the
+    /// demuxer and anchor the synchronizer at source 23029.36 s, not at absolute 7.56 s.
+    func testSeekTargetMovesOntoTheSourceAxis() {
+        XCTAssertEqual(SoftwarePlaybackHost.sourceSeconds(forPublished: 7.56, sessionZero: 23021.8),
+                       23029.36, accuracy: 1e-9)
+    }
+
+    func testZeroBasedSourcesAreUnchanged() {
+        XCTAssertEqual(SoftwarePlaybackHost.sourceSeconds(forPublished: 12.5, sessionZero: 0), 12.5)
+        XCTAssertEqual(SoftwarePlaybackHost.sourceSeconds(forPublished: 12.5, sessionZero: .nan), 12.5)
+    }
 }

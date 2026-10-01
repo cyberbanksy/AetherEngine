@@ -964,6 +964,13 @@ final class SoftwarePlaybackHost {
     @discardableResult
     /// Whether the demuxer's end of file still means end of media once the tail has drained: not when
     /// a seek moved the generation while the loop waited, because that seek repositioned the source.
+    /// The source-axis time for a published (0-based) VOD position: published + session zero. The
+    /// session zero is 0 for zero-based sources, so this is the identity there. Live seeks take the
+    /// DVR path and never reach this mapping.
+    nonisolated static func sourceSeconds(forPublished seconds: Double, sessionZero: Double) -> Double {
+        sessionZero > 0 && sessionZero.isFinite ? seconds + sessionZero : seconds
+    }
+
     nonisolated static func endOfMediaStands(generationAtRead: UInt64, generationNow: UInt64) -> Bool {
         generationAtRead == generationNow
     }
@@ -1000,8 +1007,15 @@ final class SoftwarePlaybackHost {
         // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
         currentTime = seconds
         seekInFlight = true
+        // Engine lab (ff-h264-paff-ts and the other broadcast TS rows): `seconds` is the PUBLISHED
+        // position, which is the raw clock minus the session zero (#107). The demuxer, the decoders'
+        // skip threshold and the synchronizer all run on the SOURCE axis, so a TS whose PTS start at
+        // 23021 s was repositioned to absolute 7.56 s and its clock anchored there, 23 000 s before
+        // every packet it then read: the read gate held on a 23 000 s "audio lead" and no frame ever
+        // presented again.
+        let sourceSeconds = Self.sourceSeconds(forPublished: seconds, sessionZero: clockSessionZero)
         let outcome = await dem.seekBounded(
-            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+            to: sourceSeconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
             isSuperseded: { [weak self] in self?.seekGeneration != generation })
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
@@ -1016,7 +1030,7 @@ final class SoftwarePlaybackHost {
             )
         }
 
-        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        let targetTime = CMTime(seconds: sourceSeconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
