@@ -41,6 +41,22 @@ struct VODSegmentCutter {
         self.current = baseIndex
     }
 
+    /// The packet timestamp the gate compares against the plan, in the plan's own time domain.
+    ///
+    /// The plan's boundaries are the container index's keyframe timestamps, and containers disagree on
+    /// what those are. mov/mp4 (and libavformat's generic index: TS, AVI) record DECODE times (#358).
+    /// Matroska / WebM Cues record PRESENTATION times. Feeding a Matroska plan the decode time put every
+    /// B-frame keyframe (DTS below PTS) just short of its own boundary, so the cut slipped a whole GOP:
+    /// each segment carried the next segment's content while the playlist advertised the plan's
+    /// times, seeks landed a GOP off, and the final plan segment never received a random-access point
+    /// (a seek into it stalled). Found by the engine lab (`sintel-master`, docs/engine-lab.md).
+    static func gateTimestamp(pts: Int64, dts: Int64, planIsPresentationTime: Bool) -> Int64 {
+        if planIsPresentationTime {
+            return pts != Int64.min ? pts : dts
+        }
+        return dts != Int64.min ? dts : pts
+    }
+
     /// Segment index for a video packet, in decode order, from its ITEM-axis presentation time.
     /// Advances on a keyframe that has reached the next boundary; every other packet (and an
     /// intra-segment keyframe that has not yet reached the next boundary, e.g. when the GOP is shorter

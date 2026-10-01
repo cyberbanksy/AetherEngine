@@ -114,4 +114,41 @@ final class VODSegmentCutterTests: XCTestCase {
         XCTAssertEqual(c.index(pts: 640_000, isKeyframe: true), 64)   // rebased onto seg 64's start
         XCTAssertEqual(c.index(pts: 650_000, isKeyframe: true), 65)
     }
+
+    // MARK: - Plan time domain (engine lab: Matroska Cues are presentation times)
+
+    /// Matroska plan (Cue times = keyframe PTS) and B-frame keyframes whose DTS sits two frames
+    /// (83 ms at 24 fps) below their PTS. Gating on the DTS never reached a boundary, so every cut
+    /// slipped a GOP and the final plan segment never opened. The Sintel 1080p remux in the engine
+    /// lab is the field shape: keyframes at 8.042 / 18.459 / ... / 53.084, DTS 83 ms earlier.
+    func testMatroskaPlanGatesOnPresentationTime() {
+        let cues: [Int64] = [0, 8042, 18459, 53084, 60875]
+        var c = VODSegmentCutter(sourceBoundaries: cues, planAnchorPts: 0, baseIndex: 0)
+        func key(_ pts: Int64) -> Int {
+            c.index(pts: VODSegmentCutter.gateTimestamp(pts: pts, dts: pts - 83, planIsPresentationTime: true),
+                    isKeyframe: true)
+        }
+        XCTAssertEqual(key(0), 0)
+        XCTAssertEqual(key(8042), 1)
+        XCTAssertEqual(key(18459), 2)
+        XCTAssertEqual(key(53084), 3, "the final plan segment must open on its own keyframe")
+    }
+
+    /// The pre-fix behaviour, pinned so the failure mode stays documented: the same packets gated on
+    /// DTS against a presentation-time plan stay one segment behind and never open the last one.
+    func testDecodeTimeAgainstPresentationPlanSlipsAGOP() {
+        let cues: [Int64] = [0, 8042, 18459, 53084, 60875]
+        var c = VODSegmentCutter(sourceBoundaries: cues, planAnchorPts: 0, baseIndex: 0)
+        let dts = { (pts: Int64) in VODSegmentCutter.gateTimestamp(pts: pts, dts: pts - 83, planIsPresentationTime: false) }
+        XCTAssertEqual(c.index(pts: dts(8042), isKeyframe: true), 0)
+        XCTAssertEqual(c.index(pts: dts(18459), isKeyframe: true), 1)
+        XCTAssertEqual(c.index(pts: dts(53084), isKeyframe: true), 2)
+    }
+
+    /// mov/mp4 plans are decode times (#358): the gate keeps reading the DTS there.
+    func testMovPlanStillGatesOnDecodeTime() {
+        XCTAssertEqual(VODSegmentCutter.gateTimestamp(pts: 4083, dts: 4000, planIsPresentationTime: false), 4000)
+        XCTAssertEqual(VODSegmentCutter.gateTimestamp(pts: 4083, dts: Int64.min, planIsPresentationTime: false), 4083)
+        XCTAssertEqual(VODSegmentCutter.gateTimestamp(pts: Int64.min, dts: 4000, planIsPresentationTime: true), 4000)
+    }
 }

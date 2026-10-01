@@ -446,6 +446,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// VOD keyframe-gated cutter: opens each segment at the IRAP that reaches its plan boundary (#92).
     private var vodCutter: VODSegmentCutter
+    /// Whether the plan's boundaries (the container index) are presentation times (Matroska Cues)
+    /// rather than decode times (mov/mp4, generic index). See `VODSegmentCutter.gateTimestamp`.
+    private lazy var planIsPresentationTime: Bool = demuxer.indexTimestampsArePresentationTimes
 
     private var loggedFirstVideoPktInfo = false
     /// #133 follow-up diag: one-shot confirmation that the demuxer surfaces avcC changes as AV_PKT_DATA_NEW_EXTRADATA.
@@ -3774,8 +3777,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // still follow it in decode order.
                     let thisVideoSeg = isLive
                         ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
-                        : vodCutter.index(pts: packet.pointee.dts != Int64.min
-                                               ? packet.pointee.dts : packet.pointee.pts,
+                        : vodCutter.index(pts: VODSegmentCutter.gateTimestamp(
+                                              pts: packet.pointee.pts, dts: packet.pointee.dts,
+                                              planIsPresentationTime: planIsPresentationTime),
                                           isKeyframe: isVideoKeyframe)
                     if thisVideoSeg != pumpQoSLastSeg {
                         pumpQoSLastSeg = thisVideoSeg

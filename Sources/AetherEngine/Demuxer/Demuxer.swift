@@ -1176,6 +1176,16 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Whether `indexedKeyframes` are presentation times. Matroska / WebM Cues are (CueTime is the
+    /// block's presentation timestamp); mov/mp4 sync samples and libavformat's generic index are
+    /// decode times.
+    var indexTimestampsArePresentationTimes: Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let name = formatContext?.pointee.iformat?.pointee.name else { return false }
+        return VFWDecodeOrderPTSRepair.isMatroska(String(cString: name))
+    }
+
     /// Keyframe timestamps in stream native timebase from libavformat's index.
     /// MKV populates from Cues lazily on first seek (cue-prewarm in
     /// HLSVideoEngine.start() ensures it's ready). MP4 stss / MPEG-TS populate
