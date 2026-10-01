@@ -1068,6 +1068,7 @@ public final class Demuxer: @unchecked Sendable {
             emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
         }
+        BitstreamColorRecovery.repair(ctx)
         logStreams(ctx)
         // A cell-folded DVD title is anchored on cell 0's base, which is where the stream starts (the
         // engine's source axis starts there too), so a resume that lands in a later cell can fold at once.
