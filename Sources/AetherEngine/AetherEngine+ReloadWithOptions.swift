@@ -136,6 +136,7 @@ enum SessionOptionCorrection {
         "audioOnly",
         "nativeRemoteHLS",
         "sequentialOrigin",
+        "dvdStartMode",
     ]
 
     /// Identity fields the proposal changed, in `loadIdentityFields` order. Empty means the
@@ -147,6 +148,7 @@ enum SessionOptionCorrection {
         if proposed.audioOnly != current.audioOnly { refused.append("audioOnly") }
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
         if proposed.sequentialOrigin != current.sequentialOrigin { refused.append("sequentialOrigin") }
+        if proposed.dvdStartMode != current.dvdStartMode { refused.append("dvdStartMode") }
         return refused
     }
 
@@ -189,6 +191,6 @@ enum SessionOptionCorrection {
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "isLiveRejoin", "subtitleSessionCarryover",
+        "dvdStartMode", "isLiveRejoin", "subtitleSessionCarryover",
     ]
 }

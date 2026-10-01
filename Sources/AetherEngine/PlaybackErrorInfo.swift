@@ -74,6 +74,10 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// neither gone nor unreadable, and a second player that decodes the track itself will play it.
     /// A host with a fallback ladder should DEMOTE on this one, not end the ladder.
     public static let audioBridgeProducedNoOutput = PlaybackErrorKind(rawValue: "audioBridgeProducedNoOutput")
+    /// A DVD menu session (`LoadOptions.dvdStartMode == .menu`) hit navigation it cannot follow: a
+    /// command loop, a missing program chain, unreadable title sectors. The disc itself may still play
+    /// as `.mainTitle` (Skip to Movie), which is the host's fallback.
+    public static let dvdNavigationFailed = PlaybackErrorKind(rawValue: "dvdNavigationFailed")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

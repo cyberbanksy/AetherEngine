@@ -41,7 +41,7 @@ struct PlaybackErrorInfoTests {
             .hlsPlaylistOnRawLivePath, .dolbyVisionRequiresHardware, .demuxedAudioLiveUnsupported,
             .nativeItemFailed, .noPlayableTrackWithinBudget, .masterPlaylistRejected,
             .vodSourceFailed, .softwarePipelineFailed, .audioSessionFailed,
-            .reloadFailed, .liveReloadNeverReady, .audioTrackSwitchFailed,
+            .reloadFailed, .liveReloadNeverReady, .audioTrackSwitchFailed, .dvdNavigationFailed,
         ]
         #expect(Set(kinds.map(\.rawValue)).count == kinds.count)
         #expect(PlaybackErrorKind.nativeItemFailed.rawValue == "nativeItemFailed")

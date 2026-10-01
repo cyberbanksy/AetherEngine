@@ -610,6 +610,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// is demuxed), so this has nothing to act on there and the engine says so in the log.
     public var preferredDecodePath: DecodePath = .automatic
 
+    /// DVD-Video images only: `.mainTitle` (default) plays the main title directly, exactly as before
+    /// DVD menus existed ("Skip to Movie"); `.menu` runs the disc from its first-play program chain, which
+    /// normally lands on the disc's own menu ("Play Disc"), with the state published as
+    /// `AetherEngine.dvdMenu` and input taken by `dvdNavigate` / `dvdActivate` / `dvdMenu`. A disc without
+    /// navigation data, and every non-DVD source, ignores it. See docs/dvd-menus.md.
+    public var dvdStartMode: DVDStartMode = .mainTitle
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -657,7 +664,8 @@ public struct LoadOptions: Sendable, Equatable {
         audioDelaySeconds: Double = 0,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
-        preferredDecodePath: DecodePath = .automatic
+        preferredDecodePath: DecodePath = .automatic,
+        dvdStartMode: DVDStartMode = .mainTitle
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -696,6 +704,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
         self.preferredDecodePath = preferredDecodePath
+        self.dvdStartMode = dvdStartMode
     }
 }
 
