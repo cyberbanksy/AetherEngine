@@ -40,6 +40,9 @@ Examples/DemoPlayerMac/Package.resolved
 # ignored path enjoys no protection from a checkout that wants it. That is how
 # this repo's local fixture media was destroyed once, on 2026-09-01.
 Fixtures
+# ...except the committed, generated-from-script test discs under Tests/Fixtures (DVD menu fixtures:
+# Tests/Fixtures/dvd/make-menu-fixture.sh). These are small (< 1 MB) and the tests need them in CI.
+!/Tests/Fixtures
 
 # Internal design specs + implementation plans (superpowers flow).
 # Local-only by design; never published to the public repo.
