@@ -1,0 +1,51 @@
+<dvdauthor dest="DVD" jumppad="0">
+  <vmgm>
+    <fpc>jump vmgm menu 1;</fpc>
+    <menus>
+      <video format="ntsc" aspect="16:9" widescreen="nopanscan"/>
+      <subpicture lang="en"><stream id="0" mode="widescreen"/><stream id="1" mode="letterbox"/></subpicture>
+      <pgc entry="title" pause="inf">
+        <vob file="wide_menu.mpg" pause="inf"/>
+        <button name="b1">jump titleset 1 menu entry ptt;</button>
+        <button name="b2">jump titleset 1 menu entry audio;</button>
+        <button name="b3">jump vmgm menu 2;</button>
+      </pgc>
+      <pgc>
+        <vob file="still_menu.mpg" pause="3"/>
+        <button name="b1">jump vmgm menu 1;</button>
+        <post>jump vmgm menu 1;</post>
+      </pgc>
+    </menus>
+  </vmgm>
+  <titleset>
+    <menus>
+      <video format="ntsc" aspect="4:3"/>
+      <pgc entry="root ptt" pause="inf">
+        <vob file="chap_menu.mpg" pause="inf"/>
+        <button name="b1">jump title 1 chapter 1;</button>
+        <button name="b2">jump title 1 chapter 2;</button>
+        <button name="b3">jump title 1 chapter 3;</button>
+        <button name="b4">jump title 1 chapter 4;</button>
+        <button name="b5">jump title 1 chapter 5;</button>
+        <button name="b6">jump title 1 chapter 6;</button>
+      </pgc>
+      <pgc entry="audio subtitle" pause="inf">
+        <vob file="setup_menu.mpg" pause="inf"/>
+        <button name="b1">audio = 0; jump menu entry audio;</button>
+        <button name="b2">audio = 1; jump menu entry audio;</button>
+        <button name="b3">subtitle = 64; jump menu entry audio;</button>
+        <button name="b4">subtitle = 0; jump menu entry audio;</button>
+        <button name="b5">jump vmgm menu 1;</button>
+      </pgc>
+    </menus>
+    <titles>
+      <video format="ntsc" aspect="4:3"/>
+      <audio lang="en"/><audio lang="fr"/>
+      <subpicture lang="en"/>
+      <pgc>
+        <vob file="feat_title.mpg" chapters="0,0:00:00.600,0:00:01.200,0:00:01.800,0:00:02.400,0:00:03.000"/>
+        <post>call vmgm menu 1;</post>
+      </pgc>
+    </titles>
+  </titleset>
+</dvdauthor>
