@@ -962,6 +962,12 @@ final class SoftwarePlaybackHost {
     /// issued while the demux loop sat in a slow remote read parked the main thread for the length of
     /// that read (App Hangs of 4.4 s and 5.2 s in the field on a WAN source).
     @discardableResult
+    /// Whether the demuxer's end of file still means end of media once the tail has drained: not when
+    /// a seek moved the generation while the loop waited, because that seek repositioned the source.
+    nonisolated static func endOfMediaStands(generationAtRead: UInt64, generationNow: UInt64) -> Bool {
+        generationAtRead == generationNow
+    }
+
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
         guard let dem = demuxer else { return .stalled }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
@@ -2080,6 +2086,12 @@ final class SoftwarePlaybackHost {
                 // the clock would never take the tail and end-of-media would never be reached.
                 releaseRebufferHold("end of media, nothing left to rebuffer from")
                 waitForRenderer(.drainAll)
+                // Engine lab: a seek that lands while the tail drains (a backward seek after the
+                // demuxer read to the end) has repositioned the source. Ending here parked the clock a
+                // couple of seconds after that seek's landing and finished a session that had media left.
+                guard Self.endOfMediaStands(generationAtRead: genBeforeRead, generationNow: seekGeneration()) else {
+                    return true
+                }
                 freeParkedVideo()
                 videoDecoder.flush()
                 audioDecoder?.flush()
