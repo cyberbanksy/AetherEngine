@@ -807,6 +807,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// construction, which keeps `isStreaming` true and the pb non-seekable (#126 block below).
     let sequentialOnly: Bool
 
+    /// Set when the current connection's ranged request came back 200 with the whole body; read and
+    /// cleared by the pump's reconnect decision. Guarded by `winCond`.
+    private var originIgnoredRange = false
+    /// The open's first, bounded request was answered 200 with more than was asked for.
+    private var openSawIgnoredRange = false
+
+    /// Whether a response to a bounded `bytes=0-N` request shows the origin ignoring `Range`:
+    /// 200 (not 206) with a declared body longer than the requested span. A file shorter than the
+    /// span legitimately answers in full and is not counted.
+    static func responseIgnoredBoundedRange(status: Int, expectedContentLength: Int64,
+                                            requestedRangeEnd: Int64?) -> Bool {
+        guard status == 200, let end = requestedRangeEnd, end >= 0 else { return false }
+        return expectedContentLength > end + 1
+    }
+
     /// Detour cache is VOD-only: live feeds have no meaningful random access and a
     /// non-authoritative size, so they stay on the unchanged reconnect path.
     /// #377: a detour block is a SECOND request opened while the pump's is still on the link, which
@@ -976,6 +991,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 markClosed()
                 close()
                 throw AVIOReaderError.hlsPlaylistOnVODPath
+            }
+            winCond.lock()
+            let ignoredRangeAtOpen = openSawIgnoredRange
+            winCond.unlock()
+            if !isLive, ignoredRangeAtOpen {
+                EngineLog.emit("[AVIOReader] \(label) origin ignores Range; failing this open so load() reopens it as a sequential origin", category: .demux)
+                markClosed()
+                close()
+                throw AVIOReaderError.originIgnoresRange
             }
             var tookFallback = false
             if !isLive {
@@ -1941,6 +1965,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
             // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
             let isRateLimited = Self.isRateLimitStatus(status)
+            // Engine lab: an origin that answered a ranged request with 200 + the whole body will do
+            // it again. Spending the backoff ladder on it only delays the failure (45 s+ at open);
+            // give the read up now so the load can reopen the source sequentially.
+            winCond.lock()
+            let ignoredRange = originIgnoredRange
+            originIgnoredRange = false
+            winCond.unlock()
+            if ignoredRange && !isLive {
+                EngineLog.emit("[AVIOReader] \(label) origin ignores Range at offset \(frontier); giving the read up (a retry gets the same 200)", category: .demux)
+                emitNetworkPhase(.exhausted)
+                return totalRead > 0 ? Int32(totalRead) : -1
+            }
             let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
                                        : recordReconnectAndShouldGiveUp(status: status)
             if giveUp {
@@ -2924,11 +2960,35 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 category: .demux
             )
         }
+        // Engine lab: the bounded first request (bytes=0-N) answered 200 with a body longer than
+        // N+1 is an origin that ignores Range. Its first bytes are valid, but every later ranged
+        // read will be refused the same way, so open() stops here and load() reopens sequentially.
+        winCond.lock()
+        let requestedRangeEnd: Int64? = (generation == connGeneration) ? connRangeEnd : nil
+        winCond.unlock()
+        if status == 200, requestedOffset == 0, !isLive, !sequentialOnly,
+           Self.responseIgnoredBoundedRange(status: status,
+                                            expectedContentLength: http.expectedContentLength,
+                                            requestedRangeEnd: requestedRangeEnd) {
+            RangeIgnoringOrigins.mark(url)
+            winCond.lock()
+            if generation == connGeneration { openSawIgnoredRange = true }
+            winCond.unlock()
+            EngineLog.emit(
+                "[AVIOReader] \(label) origin answered bytes=0-\(requestedRangeEnd ?? 0) with 200 and "
+                + "\(http.expectedContentLength) bytes: it ignores Range",
+                category: .demux)
+        }
         if status == 200 && requestedOffset > 0 && !isLive {
             EngineLog.emit(
                 "[AVIOReader] server ignored Range (200 for offset \(requestedOffset)); rejecting body",
                 category: .demux
             )
+            // A property of the origin, not a transient fault: retrying gets the same 200 (engine lab).
+            RangeIgnoringOrigins.mark(url)
+            winCond.lock()
+            if generation == connGeneration { originIgnoredRange = true }
+            winCond.unlock()
             isOK = false
         }
 
@@ -4279,6 +4339,9 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// instead of the AVERROR_INVALIDDATA FFmpeg reports for an empty or error-page stream, and so the
     /// error page never reaches the demuxer.
     case httpStatus(Int)
+    /// The origin answers ranged requests with 200 and the whole body (engine lab). Only a
+    /// sequential read can serve it; `load(url:)` reopens the source that way (`RangeIgnoringOrigins`).
+    case originIgnoresRange
 
     var description: String {
         switch self {
@@ -4288,6 +4351,7 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
         case .hlsPlaylistOnRawLivePath: return "HLS playlist supplied to the raw live path"
         case .hlsPlaylistOnVODPath: return "HLS playlist supplied to the VOD loopback path"
         case .httpStatus(let status): return "Origin answered HTTP \(status) for the source"
+        case .originIgnoresRange: return "Origin ignores HTTP Range requests"
         }
     }
 

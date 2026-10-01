@@ -947,7 +947,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     static func openFailure(from error: Error) -> Error {
         if let readerError = error as? AVIOReaderError {
             switch readerError {
-            case .hlsPlaylistOnVODPath, .hlsPlaylistOnRawLivePath, .httpStatus:
+            case .hlsPlaylistOnVODPath, .hlsPlaylistOnRawLivePath, .httpStatus, .originIgnoresRange:
                 return readerError
             default:
                 break

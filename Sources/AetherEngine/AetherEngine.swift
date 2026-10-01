@@ -2964,7 +2964,14 @@ public final class AetherEngine: ObservableObject {
         audioSourceStreamIndex: Int32? = nil,
         discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
-        try await load(
+        // Engine lab: an origin already seen ignoring `Range` can only be read forward from byte 0,
+        // so it opens straight onto the sequential path instead of failing its way there again.
+        var options = options
+        if RangeIgnoringOrigins.shouldRetrySequentially(url: url, isLive: options.isLive,
+                                                        alreadySequential: options.sequentialOrigin) {
+            options.sequentialOrigin = true
+        }
+        return try await load(
             source: .url(url),
             startPosition: startPosition,
             options: options,
@@ -3404,6 +3411,21 @@ public final class AetherEngine: ObservableObject {
         if let readerError = probeFailure as? AVIOReaderError, case .hlsPlaylistOnRawLivePath = readerError {
             publishError(.hlsPlaylistOnRawLivePath, "HLS playlist supplied to the raw live path. Use LoadOptions.nativeRemoteHLS or HLSLiveIngestReader for m3u8 sources.")
             throw AetherEngineError.hlsPlaylistOnRawLivePath
+        }
+
+        // Engine lab: the origin answers ranged requests with 200 + the whole body. Nothing but a
+        // forward read from byte 0 can serve it, so reopen this load as a sequential origin instead of
+        // letting every later ranged read (moov at the end, MKV Cues, seeks) hang on refusals.
+        if RangeIgnoringOrigins.shouldReopenSequentially(failure: probeFailure, isCustomSource: isCustomSource,
+                                                         isLive: loadedOptions.isLive,
+                                                         alreadySequential: loadedOptions.sequentialOrigin),
+           case .url(let rangelessURL) = source {
+            EngineLog.emit("[AetherEngine] origin ignores Range; reopening as a sequential origin", category: .engine)
+            var sequential = loadedOptions
+            sequential.sequentialOrigin = true
+            continueStartupAcrossReroute()   // #361: same wait, different route
+            return try await load(source: .url(rangelessURL), startPosition: startPosition, options: sequential,
+                                  audioSourceStreamIndex: audioSourceStreamIndex, discTitleID: discTitleID)
         }
 
         // AE#154: a non-live HLS playlist on the loopback path. FFmpeg (--disable-network) can never
@@ -4081,6 +4103,18 @@ public final class AetherEngine: ObservableObject {
                 continueStartupAcrossReroute()   // #361, same wait, different route
                 _ = try await load(source: .url(hlsURL), startPosition: startPosition, options: rerouted)
                 return nil
+            }
+            // Engine lab: same sequential reopen as at the probe, for the session's own open.
+            if RangeIgnoringOrigins.shouldReopenSequentially(failure: error, isCustomSource: isCustomSource,
+                                                             isLive: loadedOptions.isLive,
+                                                             alreadySequential: loadedOptions.sequentialOrigin),
+               case .url(let rangelessURL) = source, loadGeneration == gen {
+                EngineLog.emit("[AetherEngine] origin ignores Range (session open); reopening as a sequential origin", category: .engine)
+                var sequential = loadedOptions
+                sequential.sequentialOrigin = true
+                continueStartupAcrossReroute()
+                return try await load(source: .url(rangelessURL), startPosition: startPosition, options: sequential,
+                                      audioSourceStreamIndex: audioSourceStreamIndex, discTitleID: discTitleID)
             }
             publishLoadFailure(error)
             throw error
