@@ -132,6 +132,9 @@ func printUsage() {
                         (raw demuxer packet timing, before dts repair and muxing)
       aetherctl bgaudio [--fg N] [--bg N] <url>
                         (SW-path background audio headless on macOS; DEBUG builds only)
+      aetherctl lab [--seconds N] [--sw] [--native-hls] [--live] [--no-seeks] [--out result.json] [--verbose] <url>
+                    (engine lab: open/probe/route/first frame/play window/3 seeks/drift/memory as JSON;
+                     driven by Scripts/engine-lab/lab.py, see docs/engine-lab.md)
       aetherctl smbtest [--reads N] <smb-url>
                         (SMB byte source: throughput pass + random-seek consistency; macOS)
       aetherctl <url>             (alias for `serve`)
@@ -277,6 +280,11 @@ if first == "--help" || first == "-h" || first == "help" {
     exit(0)
 }
 
+
+// Engine lab: one scoreboard measurement per source, JSON out (docs/engine-lab.md).
+if first == "lab" {
+    exit(runLab(arguments: Array(args.dropFirst(2))))
+}
 
 if first == "dvr" {
     var rest = Array(args.dropFirst(2))
