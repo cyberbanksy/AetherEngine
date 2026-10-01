@@ -605,7 +605,6 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
             let target = min(duration * fraction, max(0, duration - cfg.postSeekWindow - 2.5))
             var s: [String: Any] = ["fraction": fraction, "target": labRound(target)]
             if engine.state == .ended || engine.state == .paused { engine.play() }
-            if engine.videoRoute == .software { tbWatcher.reset() }
             let preIndex = recorder.count
             let preLast = recorder.last
             let issued = labNow()
@@ -634,6 +633,9 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
             }
             if let landing {
                 s["landed"] = true
+                // Starvation is judged from the landing on: the hold while the seek itself is in
+                // flight is the seek latency, already measured above.
+                if engine.videoRoute == .software { tbWatcher.reset() }
                 s["frameLatencyMs"] = labRound((landing.wall - issued) * 1000, 10)
                 let clockAtLanding = engine.currentTime
                 try? await Task.sleep(nanoseconds: UInt64(cfg.postSeekWindow * 1_000_000_000))
