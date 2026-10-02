@@ -26,10 +26,11 @@ swift run aetherctl hlsfixture <ts>      # local HLS live fixture with fault kno
 swift run aetherctl seektest <url>       # rapid-seek burst repro + clock-bounce / isSeeking probe
 swift run aetherctl hlslive              # SSAI live-direct-play repro against a synthetic ad-pod feed
 swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via the AetherEngineSMB reader
+swift run aetherctl lab <url>            # engine-lab measurement of one source as JSON (docs/engine-lab.md)
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Twenty-three subcommands plus the bare-URL `serve` alias.
+Twenty-four subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
@@ -885,6 +886,14 @@ The `#65` block of the results separates two parks that look alike in a log and 
 ## hlslive
 
 Replays a synthetic SSAI ad-pod feed through the live-direct-play path to repro the FAST-channel ad-break handling (program-switch detection, muxer rotation with versioned `#EXT-X-MAP`, audio re-anchor, no-cut watchdog). `--segments a.ts,b.ts,c.ts` is required: a comma-separated list of real `.ts` segment files served in order (content / ad / content) without timestamp rewriting. `--seconds N` (default 40) and `--segment-seconds N` (default 5) size the run; `--disc i,j` marks which segment indices carry a leading `#EXT-X-DISCONTINUITY` (default: auto-detected on every file change).
+
+## lab
+
+One engine-lab measurement of one source, written as JSON (`--out r.json`, stdout otherwise). It covers open, probe, route, the first presented frame, a play window (`--seconds`, default 6), seeks to 50 / 90 / 10 % with seek-to-frame latency and post-seek continuity, drift, and the memory peak. Frames are observed headless through an `AVPlayerItemVideoOutput` on the native routes and through the frame-time observer plus the presentation timebase on the software route. The engine is muted. URLs are redacted from everything it records.
+
+`--sw` forces the software route, `--native-hls` the remote-HLS bypass, `--live` the live path, and `--no-seeks` skips the seeks. `--verbose` echoes the engine log.
+
+`Scripts/engine-lab/lab.py` runs it over the whole corpus and builds the scoreboard. See [engine-lab.md](engine-lab.md).
 
 ## smbtest
 
