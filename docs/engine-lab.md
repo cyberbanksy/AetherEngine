@@ -170,3 +170,48 @@ mkvmerge --no-cues -o g-mkv-nocues.mkv master.mkv
    `lab_args` passes extra `aetherctl lab` flags (e.g. `["--native-hls"]`).
 2. `fetch_corpus.py --only <id>`, then `lab.py run --only <id>`.
 3. When the case exposes an engine defect, fix it with a regression test in `Tests/AetherEngineTests`. Re-run the affected rows and paste `lab.py compare` into the commit or PR.
+
+## First runs (2026-10-01)
+
+These two runs used 98 sources. The `after-fixes` run used the engine at `2fe42dd7`.
+
+| metric | baseline | after fixes |
+|---|---:|---:|
+| crash | 98/98 | 98/98 |
+| open | 95/98 | 97/98 |
+| oracle | 95/98 | 96/98 |
+| ttff | 92/93 | 94/94 |
+| playback | 90/93 | 91/94 |
+| frames | 80/93 | 82/94 |
+| seek_latency | 55/82 | 71/84 |
+| seek_continuity | 63/82 | 70/82 |
+| av_drift | 82/92 | 78/93 |
+| memory | 98/98 | 98/98 |
+
+Two caveats about comparing these runs:
+
+- The harness started counting software-route display starvation from the seek landing (not from the seek call) between the two runs.
+- The new seek_continuity failures on the broadcast TS rows are rows whose seeks never landed before. Their continuity is now measured for the first time.
+- The av_drift failures on the software route are the presented-vs-clock number sitting at 100-130 ms. That number is measured against frames as they are enqueued, so it needs a presented-frame measure before it is trusted.
+
+Fixes, each with a regression test:
+
+- **Matroska cut slip.** The VOD cutter now gates Matroska plans on presentation time. Every segment of a B-frame MKV carried the next GOP, and seeking into the last segment stalled.
+- **Range-ignoring origins.** An origin that answers a range request with 200 is now detected at open and reopened sequentially. Before, the load hung for more than 45 s.
+- **Missing HEVC colour.** When the container states no colour, the demuxer now adopts the colour from the HEVC VUI. HDR10 in an MKV without a Colour element failed with -12927.
+- **Seek during the end-of-file drain (software route).** A seek that arrives during the drain no longer ends the session. Every backward seek after a read-to-EOF had ended playback.
+- **Seek axis (software route).** Seeks now use the source axis. A TS whose PTS starts at 23 000 s never presented a frame after a seek.
+
+Open items, worst first:
+
+- **Seek stutter on software AV1.** The clock restarts before decode has a cushion, so the display starves for 100-1000 ms after each seek (`jf-av1-*`). This needs a post-seek preroll gate.
+- **Truncated or partial files.** On a file with a declared duration past the end of its data, a seek past the data never lands and stalls for 12 s (`ff-eac3-mkv`, `ff-vobsub-largeres`, `g-mkv-truncated`, `ff-lalaland-4k-hdr`). It should land at the data's end, or end the session.
+- **Sequential MKV.** With the range quirk and no declared duration, a sequential MKV mis-plans and the startup seek to 0 fails it (`q-range-ignored-mkv`).
+- **Origin without Content-Length.** A chunked origin with no length (`q-no-length`) fails demuxer reads on the software route.
+- **Interlaced H.264 TS.** PAFF/MBAFF TS and MPEG-2 1080i on the software route freeze for 0.5-2.7 s while playing.
+- **Bipbop black flash.** The remote bypass shows a black frame at every seek on Apple's bipbop fMP4. This needs a check that the black frame is not part of the content.
+- **Smaller items:**
+  - `ff-vc1-mkv` ends at 0.76 s of 7 s.
+  - The TS PTS-wrap row's 90 % seek never lands.
+  - After a 403 expiry, the 90 % seek never lands. It should surface an error.
+  - RealVideo (`ff-mkv-size-change`) is unsupported by design.
