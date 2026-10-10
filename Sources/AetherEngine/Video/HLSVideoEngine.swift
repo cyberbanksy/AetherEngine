@@ -655,11 +655,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Only a genuine demux EOF may establish this bound, never an index, header duration,
     /// backpressure park or interrupted read. Protected by restartLock.
     var confirmedEOFSourceEndSeconds: Double?
+    /// Raw demux PTS cannot bound an item whose source clock wraps or whose producer folds
+    /// discontinuities. Limit enforcement to the Matroska path measured by the engine lab.
+    /// Protected by restartLock after start establishes the source type.
+    var enforcesRawEOFBound = false
+
+    static func supportsRawEOFBound(containerFormatName: String?, foldsTimeline: Bool) -> Bool {
+        guard !foldsTimeline, let containerFormatName else { return false }
+        return containerFormatName.split(separator: ",").contains("matroska")
+    }
+
 
     func seekIsBeyondKnownSourceEnd(itemSeconds: Double) -> Bool {
         guard !isLiveSession else { return false }
         restartLock.lock()
-        let end = confirmedEOFSourceEndSeconds
+        let end = enforcesRawEOFBound ? confirmedEOFSourceEndSeconds : nil
         restartLock.unlock()
         return Self.seekExceedsConfirmedEOF(itemSeconds: itemSeconds,
                                            shiftSeconds: playlistShiftSeconds,
@@ -1042,6 +1052,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let formatStart = dem.formatStartTime
         sourceStartSeconds = formatStart == Int64.min ? 0 : max(0, Double(formatStart) / Double(AV_TIME_BASE))
         let durationSeconds = dem.duration
+        restartLock.lock()
+        enforcesRawEOFBound = Self.supportsRawEOFBound(
+            containerFormatName: dem.containerFormatName,
+            foldsTimeline: sequentialOriginPinsProducerToZero)
+        restartLock.unlock()
+
         var plan: [Segment]
         if isLiveSession {
             sourceBitrate = dem.bitRate
@@ -2257,6 +2273,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         savedVideoConfig = nil
         savedAudioConfig = nil
         confirmedEOFSourceEndSeconds = nil
+        enforcesRawEOFBound = false
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
         let reopening = reopenDemuxer
