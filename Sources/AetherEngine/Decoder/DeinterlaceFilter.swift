@@ -324,10 +324,17 @@ final class DeinterlaceFilter {
         return desc.pointee.comp.0.depth > 8
     }
 
-    /// Feed a decoded frame (takes ownership; frame is reset after the call).
+    /// Feed a reference to a decoded frame. Keep the caller's frame intact so a failed
+    /// filter push can safely fall back to rendering it directly.
     func push(_ frame: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let src = srcCtx else { return -1 }
-        return av_buffersrc_add_frame_flags(src, frame, 0)
+        return av_buffersrc_add_frame_flags(src, frame, Int32(AV_BUFFERSRC_FLAG_KEEP_REF))
+    }
+
+    /// Signal source EOF so the temporal filter emits its final lookahead picture.
+    func finish() -> Int32 {
+        guard let src = srcCtx else { return 0 }
+        return av_buffersrc_add_frame_flags(src, nil, 0)
     }
 
     /// Pull the next filtered frame into `out`. Returns >= 0 on success, AVERROR(EAGAIN) when the
