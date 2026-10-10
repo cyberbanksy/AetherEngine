@@ -263,7 +263,9 @@ extension HLSVideoEngine {
         if case .eof = reason, !isLiveSession,
            let end = prod.observedVideoSourceEndSeconds {
             restartLock.lock()
-            confirmedEOFSourceEndSeconds = max(confirmedEOFSourceEndSeconds ?? end, end)
+            if enforcesRawEOFBound {
+                confirmedEOFSourceEndSeconds = max(confirmedEOFSourceEndSeconds ?? end, end)
+            }
             restartLock.unlock()
             if let pending = recoverySeekTargetProvider?(), seekIsBeyondKnownSourceEnd(itemSeconds: pending) {
                 surfaceVODSourceFailure(FFmpegErr.eof, "Source ended before the requested seek position")

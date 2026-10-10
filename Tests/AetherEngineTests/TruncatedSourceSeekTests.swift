@@ -28,6 +28,16 @@ struct TruncatedSourceSeekTests {
         #expect(engine.sourceTime == rendered)
     }
 
+    @Test("Raw EOF bounds are limited to verified Matroska sources without timeline folding")
+    func discontinuousSourceDoesNotAcquireRawEOFBound() {
+        #expect(HLSVideoEngine.supportsRawEOFBound(containerFormatName: "matroska,webm", foldsTimeline: false))
+        #expect(!HLSVideoEngine.supportsRawEOFBound(containerFormatName: "mpegts", foldsTimeline: false))
+        #expect(!HLSVideoEngine.supportsRawEOFBound(containerFormatName: "mpegts", foldsTimeline: true))
+        #expect(!HLSVideoEngine.supportsRawEOFBound(containerFormatName: "matroska,webm", foldsTimeline: true))
+        #expect(!HLSVideoEngine.supportsRawEOFBound(containerFormatName: "mov,mp4,m4a,3gp,3g2,mj2", foldsTimeline: false))
+        #expect(!HLSVideoEngine.supportsRawEOFBound(containerFormatName: nil, foldsTimeline: false))
+    }
+
     @Test("Only confirmed EOF bounds reject a native seek; header duration is irrelevant")
     func confirmedSourceExtentBoundsSeek() {
         #expect(HLSVideoEngine.seekExceedsConfirmedEOF(itemSeconds: 4850, shiftSeconds: 0, sourceEndSeconds: 47))
