@@ -277,29 +277,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                    deinterlacer.push(f) >= 0 {
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered {
-                        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
-                            // Untimestamped output is unschedulable: yadif's SECOND field is
-                            // cur.pts + next.pts, which is NOPTS whenever either source frame
-                            // lacked a PTS (live TS delivers those); an invalid-PTS sample
-                            // can't be paced by the render synchronizer and can wedge the
-                            // display queue. Drop it; at field rate the neighbor field covers.
-                            if out.pointee.pts == Int64.min {
-                                droppedUntimestampedFields += 1
-                                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                                    EngineLog.emit(
-                                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
-                                        category: .swPlayback
-                                    )
-                                }
-                                av_frame_unref(out)
-                                continue
-                            }
-                            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
-                            // halve the link time_base, and send_field puts the two fields of a frame
-                            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
-                            emit(out, timeBase: deinterlacer.outputTimeBase)
-                            av_frame_unref(out)
-                        }
+                        drainFilteredFrames(into: out)
                     }
                     lock.unlock()
                     continue
@@ -314,6 +292,49 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         av_frame_free(&frame)
         if filtered != nil { av_frame_free(&filtered) }
+    }
+
+    /// Called with the decoder lock held, both during decode and after source EOF.
+    private func drainFilteredFrames(into out: UnsafeMutablePointer<AVFrame>) {
+        while deinterlacer.pull(into: out) >= 0 {
+            if out.pointee.pts == Int64.min {
+                droppedUntimestampedFields += 1
+                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
+                        category: .swPlayback
+                    )
+                }
+            } else {
+                // Fields retain the sink's time base, including its half-frame ticks.
+                emit(out, timeBase: deinterlacer.outputTimeBase)
+            }
+            av_frame_unref(out)
+        }
+    }
+
+    /// Preserve frame-threaded codec pictures and temporal-filter lookahead at EOF.
+    /// A seek uses flush() instead: those delayed pictures belong to the old timeline.
+    func finish() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        var result = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        if result == FFmpegErr.eagain {
+            drainDecodedFrames()
+            lock.lock()
+            if let currentContext = codecContext { result = avcodec_send_packet(currentContext, nil) }
+            lock.unlock()
+        }
+        drainDecodedFrames()
+
+        lock.lock()
+        defer { lock.unlock() }
+        guard codecContext != nil, deinterlacer.isActive else { return }
+        guard deinterlacer.finish() >= 0, let output = av_frame_alloc() else { return }
+        var ownedOutput: UnsafeMutablePointer<AVFrame>? = output
+        defer { av_frame_free(&ownedOutput) }
+        drainFilteredFrames(into: output)
     }
 
     /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer

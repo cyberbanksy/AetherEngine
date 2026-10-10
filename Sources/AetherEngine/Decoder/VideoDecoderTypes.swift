@@ -24,8 +24,15 @@ protocol VideoDecodingPipeline: AnyObject, Sendable {
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws
     func decode(packet: UnsafeMutablePointer<AVPacket>)
+    /// Deliver delayed pictures at real source EOF; unlike flush, retain valid output.
+    func finish()
     func flush()
     func close()
+}
+
+extension VideoDecodingPipeline {
+    // VideoToolbox's existing flush waits for asynchronous and delayed frames.
+    func finish() { flush() }
 }
 
 enum VideoDecoderError: Error, LocalizedError {
