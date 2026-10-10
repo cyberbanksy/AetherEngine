@@ -802,12 +802,13 @@ final class SoftwarePlaybackHost {
         // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
         if pausedByHost {
             pausedByHost = false
-            if clockArmed {
+            if clockArmed, !seekInFlight {
                 audioOutput?.setRate(lastRate)
             }
         }
-        if !demuxLoopStarted, let aOut = audioOutput {
+        if !videoLayerAttached, let aOut = audioOutput {
             aOut.attachVideoLayer(renderer.displayLayer)
+            videoLayerAttached = true
         }
         if !demuxLoopStarted {
             demuxLoopStarted = true
@@ -820,6 +821,8 @@ final class SoftwarePlaybackHost {
     }
 
     private var demuxLoopStarted: Bool = false
+    private var demuxPumpID: UInt64 = 0
+    private var videoLayerAttached = false
 
     /// #95 audio tap: mirrors every decoded audio CMSampleBuffer to the tap (nil = tap off).
     /// Set/cleared on the main actor by AetherEngine+AudioTap; read per packet on the demux and
@@ -877,31 +880,61 @@ final class SoftwarePlaybackHost {
     /// `.ended` is terminal, so nothing will consume the clock again, but the synchronizer used to keep
     /// its rate: `currentTime` then walked past `duration` without bound (measured: 20.13 s published on
     /// a 12.0 s source, against a native session that parks on 11.97 s and stays there). Deferred by the
-    /// audio still queued ahead of the playhead, because parking the synchronizer stops its renderers
+    /// decoded audio or video still queued ahead of the playhead, because parking the synchronizer stops its renderers
     /// too and an immediate park would cut that tail. `pausedByHost` stays false: the viewer did not
     /// pause this, the source ran out.
     private func parkClockAtEndOfMedia() {
         guard !didParkClockAtEnd else { return }
         didParkClockAtEnd = true
-        guard clockArmed, let aOut = audioOutput else { return }
+        let lastAudio = demuxDiag.snapshot.lastAudioPts
+        let lastVideo = renderer.newestEnqueuedPtsSeconds ?? .nan
+        let clock = audioOutput?.currentTimeSeconds ?? sourceClockSeconds
+        let finalClock = SoftwareEndOfMediaClock.finalClockSeconds(
+            clockSeconds: clock, lastAudioPts: lastAudio, lastVideoPts: lastVideo)
         let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
-            clockSeconds: aOut.currentTimeSeconds,
-            lastAudioPts: demuxDiag.snapshot.lastAudioPts
-        )
-        guard tail > 0 else { return parkClockNow() }
+            clockSeconds: clock, lastAudioPts: lastAudio, lastVideoPts: lastVideo)
+        guard clockArmed, tail > 0 else { return parkClockNow(finalSourceSeconds: finalClock) }
+        let endingGeneration = seekGeneration
+        let tailTarget = clock + tail
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
-            self?.parkClockNow()
+            // Wait on media time, so pause and playback speed apply to the queued tail too.
+            // The frontier is clamped by the policy; a damaged timestamp cannot delay end
+            // indefinitely while playback is running.
+            while let self, self.seekGeneration == endingGeneration, !self.stopRequested,
+                  let output = self.audioOutput, output.currentTimeSeconds < tailTarget {
+                do { try await Task.sleep(for: .milliseconds(10)) }
+                catch { return }
+            }
+            guard let self, self.seekGeneration == endingGeneration, !self.stopRequested else { return }
+            self.parkClockNow(finalSourceSeconds: finalClock)
         }
     }
 
-    private func parkClockNow() {
-        guard !stopRequested, let aOut = audioOutput else { return }
-        aOut.pause()
+    private func parkClockNow(finalSourceSeconds: Double) {
+        guard !stopRequested else { return }
+        if finalSourceSeconds.isFinite {
+            audioOutput?.seekClock(to: CMTime(seconds: finalSourceSeconds, preferredTimescale: 90000), rate: 0)
+            // Publish the final position before `.ended`: consumers often stop sampling at
+            // that edge, before the next 250 ms clock tick can expose the codec's last frame.
+            sourceClockSeconds = finalSourceSeconds
+            let zero: Double
+            if isLive {
+                liveEdgeLock.lock()
+                zero = sessionStartPts.isFinite ? sessionStartPts : 0
+                liveEdgeLock.unlock()
+            } else {
+                zero = clockSessionZero
+            }
+            currentTime = max(0, finalSourceSeconds - zero)
+        } else {
+            audioOutput?.pause()
+        }
         rate = 0
+        isPlaying = false
+        didReachEnd = true
         EngineLog.emit(
             "[SWHost] end of media: clock parked at "
-            + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
+            + "\(String(format: "%.3f", sourceClockSeconds))s",
             category: .swPlayback
         )
     }
@@ -936,7 +969,7 @@ final class SoftwarePlaybackHost {
         // right after load(), before the demux/feeder loop armed the clock, wedged the
         // delayed-rate-change machinery and froze live sessions on the first frame; the arming
         // seekClock picks up lastRate instead (#107).
-        if clockArmed {
+        if clockArmed, !seekInFlight {
             audioOutput?.setRate(newRate)
         }
     }
@@ -981,6 +1014,8 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
+        didParkClockAtEnd = false
+        didReachEnd = false
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -1021,7 +1056,6 @@ final class SoftwarePlaybackHost {
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
         // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
         guard seekGeneration == generation, !stopRequested else { return .superseded }
-        seekInFlight = false
         if outcome == .stalled {
             EngineLog.emit(
                 "[SWHost] reposition to \(String(format: "%.2f", seconds))s did not complete within "
@@ -1036,20 +1070,52 @@ final class SoftwarePlaybackHost {
 
         currentTime = seconds
 
-        // #292: the intent is read HERE, not from what this seek captured on entry. `pause()` / `play()`
-        // during the reposition rewrite the stash, and a landing that ignored them either overrode the
-        // pause (kept playing) or, from the other side, anchored at rate 0 under a running loop.
+        // Hold the clock while the decoder rebuilds its reference chain. Starting it before
+        // AV1 produced a landing frame made every frame arrive late and the renderer drop a
+        // burst immediately after a seek. The loop must run to fill while the clock is parked.
+        audioOutput?.seekClock(to: targetTime, rate: 0)
+        clockArmed = true
         if inFlightSeekResumeIntent {
-            // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
-            audioOutput?.seekClock(to: targetTime, rate: lastRate)
+            isPlaying = true
+            if !demuxLoopStarted {
+                demuxLoopStarted = true
+                startDemuxLoop()
+            }
+            let prerollStart = ProcessInfo.processInfo.systemUptime
+            while videoStreamIndex >= 0, inFlightSeekResumeIntent,
+                  !didReachEnd, failure == nil,
+                  SoftwareSeekPreroll.shouldWait(
+                    target: sourceSeconds, newestVideoPTS: renderer.newestEnqueuedPtsSeconds,
+                    rendererReady: renderer.isReadyForMoreMediaData,
+                    elapsed: ProcessInfo.processInfo.systemUptime - prerollStart) {
+                do { try await Task.sleep(for: .milliseconds(10)) }
+                catch { break }
+                // A second seek or stop may own this host after each suspension.
+                guard seekGeneration == generation, !stopRequested else { return .superseded }
+            }
+            EngineLog.emit(
+                "[SWHost] seek preroll: waited="
+                + "\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime - prerollStart))s "
+                + "videoLead=\(String(format: "%.3f", (renderer.newestEnqueuedPtsSeconds ?? sourceSeconds) - sourceSeconds))s "
+                + "rendererReady=\(renderer.isReadyForMoreMediaData)",
+                category: .swPlayback
+            )
+        }
+        guard seekGeneration == generation, !stopRequested else { return .superseded }
+        seekInFlight = false
+        // A truncated source can exhaust while preroll is awaiting its first frame. Never
+        // restart the clock after its terminal callback has already parked the session.
+        guard !didReachEnd, failure == nil else { return .stalled }
+        // Transport intent is read after preroll: pause/play/rate commands during either
+        // suspension must win, and play/setRate must not lift the parked clock early.
+        if inFlightSeekResumeIntent {
+            pausedByHost = false
+            audioOutput?.setRate(lastRate)
             isPlaying = true
         } else {
-            // Paused seek: anchor at target with rate 0 so play() resumes from the seek position (without this, scrubs freeze or drop all samples).
-            audioOutput?.seekClock(to: targetTime, rate: 0)
             pausedByHost = true
+            isPlaying = false
         }
-        // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
-        clockArmed = true
         return outcome
     }
 
@@ -1159,6 +1225,7 @@ final class SoftwarePlaybackHost {
             aOut.detachVideoLayer(renderer.displayLayer)
         }
         audioOutput = nil
+        videoLayerAttached = false
         audioDecoder?.close()
         audioDecoder = nil
         videoDecoder.close()
@@ -1182,6 +1249,8 @@ final class SoftwarePlaybackHost {
     /// Capture dependencies as locals so the demux loop runs off-main without re-entering the actor.
     private func startDemuxLoop() {
         guard let dem = demuxer else { return }
+        demuxPumpID &+= 1
+        let pumpID = demuxPumpID
         let vDec = videoDecoder
         let vIdx = videoStreamIndex
         let aDec = audioDecoder
@@ -1224,15 +1293,24 @@ final class SoftwarePlaybackHost {
                 self?.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
             }
         }
-        let onEnd: @Sendable () -> Void = { [weak self] in
-            // AE#374: the diagnostic line has to say the producer is done, or a falling aLead over a
-            // frozen audio PTS reads exactly like drift on a running session.
-            self?.demuxDiag.markSourceExhausted()
+        let onEnd: @Sendable (UInt64) -> Void = { [weak self] endingGeneration in
+            // The accepted EOF always retires this pump, even if a seek wins before
+            // the main actor receives its callback. Retirement and end publication are
+            // separate: the former lets that seek queue its replacement pump safely.
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, !self.stopRequested,
+                      SoftwareEndOfMediaClock.canRetirePump(finishing: pumpID, active: self.demuxPumpID)
+                else { return }
+                if !self.isLive { self.demuxLoopStarted = false }
+                guard self.seekGeneration == endingGeneration else {
+                    if !self.isLive, !self.seekInFlight, self.isPlaying {
+                        self.demuxLoopStarted = true
+                        self.startDemuxLoop()
+                    }
+                    return
+                }
+                self.demuxDiag.markSourceExhausted()
                 self.parkClockAtEndOfMedia()
-                self.didReachEnd = true
-                self.isPlaying = false
             }
         }
 
@@ -1313,7 +1391,7 @@ final class SoftwarePlaybackHost {
                     sourceEnded: getSourceEnded,
                     clockArmed: getClockArmed,
                     markClockArmed: setClockArmed,
-                    onEnd: onEnd,
+                    onEnd: { onEnd(getSeekGeneration()) },
                     audioTapSink: getAudioTapSink
                 )
             }
@@ -1842,7 +1920,7 @@ final class SoftwarePlaybackHost {
         seekGeneration: @Sendable () -> UInt64,
         backgroundAudioOnly: @Sendable () -> Bool,
         onError: @Sendable (String) -> Void,
-        onEnd: @Sendable () -> Void,
+        onEnd: @Sendable (UInt64) -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
@@ -2107,10 +2185,29 @@ final class SoftwarePlaybackHost {
                     return true
                 }
                 freeParkedVideo()
-                videoDecoder.flush()
-                audioDecoder?.flush()
+                videoDecoder.finish()
+                if let audioDecoder, let audioOutput {
+                    let tapSink = audioTapSink()
+                    for buffer in audioDecoder.drain() {
+                        tapSink?(buffer)
+                        audioOutput.enqueue(sampleBuffer: buffer)
+                        let pts = CMSampleBufferGetPresentationTimeStamp(buffer)
+                        let duration = CMSampleBufferGetDuration(buffer)
+                        if pts.isValid {
+                            lastEnqueuedAudioPtsSec = pts.seconds
+                                + (duration.isValid && duration.seconds.isFinite ? duration.seconds : 0)
+                        }
+                    }
+                    diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
+                                 parked: 0, rebuffering: false)
+                }
                 renderer.drainReorderBuffer()
-                onEnd()
+                // Decoder drain and reorder delivery can also overlap a seek. Retain the
+                // generation of the EOF read through the queued actor callback; capturing it
+                // there would incorrectly label an old EOF as the new seek's end.
+                guard Self.endOfMediaStands(
+                    generationAtRead: genBeforeRead, generationNow: seekGeneration()) else { return true }
+                onEnd(genBeforeRead)
                 return false
             }
 

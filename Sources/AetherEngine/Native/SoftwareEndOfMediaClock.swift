@@ -16,13 +16,24 @@ enum SoftwareEndOfMediaClock {
     /// buy an unbounded runway on a session that is already over.
     static let maxTailPlayoutSeconds: TimeInterval = 5.0
 
-    /// Seconds to let the clock run before parking it: the decoded audio still ahead of the playhead,
-    /// clamped. Zero (park now) when the source carries no audio, when its PTS is unusable, or when the
-    /// clock has already passed it, which is the normal VOD case because the drain that precedes end of
-    /// media has already walked the clock to the last video frame.
-    static func tailPlayoutSeconds(clockSeconds: Double, lastAudioPts: Double) -> TimeInterval {
-        guard clockSeconds.isFinite, lastAudioPts.isFinite else { return 0 }
-        let remaining = lastAudioPts - clockSeconds
+    static func canRetirePump(finishing: UInt64, active: UInt64) -> Bool {
+        finishing == active
+    }
+
+    static func finalClockSeconds(clockSeconds: Double, lastAudioPts: Double,
+                                  lastVideoPts: Double) -> Double {
+        guard let frontier = [lastAudioPts, lastVideoPts].filter({ $0.isFinite }).max() else { return clockSeconds }
+        return clockSeconds.isFinite ? min(frontier, clockSeconds + maxTailPlayoutSeconds) : frontier
+    }
+
+    /// Seconds to let the clock run before parking it. Decoder EOF draining can produce
+    /// video after the last audio, or on a video-only source, so use the later valid frontier.
+    static func tailPlayoutSeconds(clockSeconds: Double, lastAudioPts: Double,
+                                   lastVideoPts: Double = .nan) -> TimeInterval {
+        guard clockSeconds.isFinite else { return 0 }
+        let frontiers = [lastAudioPts, lastVideoPts].filter { $0.isFinite }
+        guard let lastPTS = frontiers.max() else { return 0 }
+        let remaining = lastPTS - clockSeconds
         guard remaining > 0 else { return 0 }
         return min(remaining, maxTailPlayoutSeconds)
     }
