@@ -6019,6 +6019,12 @@ public final class AetherEngine: ObservableObject {
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
         // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
         var clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
+        if nativeVideoSession?.seekIsBeyondKnownSourceEnd(itemSeconds: clockTarget) == true {
+            publishError(.vodSourceFailed, "Source ended before the requested seek position")
+            finishSeekAfterTerminalSourceEvent()
+            nativeHost?.cancelSeekForTerminalSourceFailure()
+            return
+        }
         // AE#418 round 2: AVPlayer throws a sub-second axis offset away at a seek and snaps back to
         // the playlist; a larger one it carries through unchanged (measured with `play
         // --picture-probe`: -0.500 and -0.875 read `axisErr=0.000` after a seek, -1.000 through
@@ -6060,6 +6066,13 @@ public final class AetherEngine: ObservableObject {
         clockTarget = await Self.prepareSeekLanding(
             session: nativeVideoSession, itemSeconds: clockTarget)
         guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
+        // A recut may have proved EOF while preparation waited for its gate.
+        if nativeVideoSession?.seekIsBeyondKnownSourceEnd(itemSeconds: clockTarget) == true {
+            publishError(.vodSourceFailed, "Source ended before the requested seek position")
+            finishSeekAfterTerminalSourceEvent()
+            nativeHost?.cancelSeekForTerminalSourceFailure()
+            return
+        }
         let gen = loadGeneration
         // Publish the native-path seek target up front so the scrub clock snaps immediately (#37); the host
         // suppresses periodic-observer reads until landing. SW/audio hosts resolve synchronously and write
@@ -6124,6 +6137,10 @@ public final class AetherEngine: ObservableObject {
                 // Deadline expired. Only the surviving (winning) generation reconciles; a superseded seek
                 // returns at the guard below and lets the newer seek own the final state.
                 guard loadGeneration == gen, seekGeneration == seekGen else { return }
+                if Self.seekMustPreserveTerminalState(state) {
+                    finishSeekAfterTerminalSourceEvent()
+                    return
+                }
                 guard let host = nativeHost else {
                     EngineLog.emit(
                         "[AetherEngine] seek deadline expired after native host teardown",
@@ -6393,6 +6410,10 @@ public final class AetherEngine: ObservableObject {
         // Guard: stop/load during the await tore the session down; writing clock state would publish a phantom.
         // A superseding seek owns the final state.
         guard loadGeneration == gen, seekGeneration == seekGen else { return }
+        if Self.seekMustPreserveTerminalState(state) {
+            finishSeekAfterTerminalSourceEvent()
+            return
+        }
         setPendingRecoverySeekTarget(nil)
         if softwareHost != nil, hostReposition != .landed {
             setProgrammaticSeek(inFlight: false, target: nil)
@@ -6462,6 +6483,31 @@ public final class AetherEngine: ObservableObject {
                             hostReposition: hostReposition,
                             renderedTime: PresentationAxis.display(sourcePTS: clock.sourceTime,
                                                                    origin: sourcePresentationOrigin)))
+    }
+
+    /// A source exhausted or failed while a host was awaiting its landing. The host's
+    /// terminal event owns the state; completing the seek must not resurrect playback.
+    nonisolated static func seekMustPreserveTerminalState(_ state: PlaybackState) -> Bool {
+        switch state {
+        case .ended, .error: return true
+        default: return false
+        }
+    }
+
+    func finishSeekAfterTerminalSourceEvent() {
+        guard Self.seekMustPreserveTerminalState(state) else { return }
+        setPendingRecoverySeekTarget(nil)
+        nativeScrubSeekInFlight = false
+        nativeScrubSeekTarget = nil
+        deferredSeekInFlight = false
+        deferredSeekTarget = nil
+        pendingScrubLanding = nil
+        scrubLandingWatchdog?.cancel()
+        scrubLandingWatchdog = nil
+        setProgrammaticSeek(inFlight: false, target: nil)
+        closeSeekTicket(&programmaticSeekTicket, with: .stalled)
+        closeSeekTicket(&nativeScrubSeekTicket, with: .stalled)
+        closeSeekTicket(&deferredSeekTicket, with: .stalled)
     }
 
     /// #254: how a SW/audio-host reposition maps onto this seek's ticket. A reposition that spent its

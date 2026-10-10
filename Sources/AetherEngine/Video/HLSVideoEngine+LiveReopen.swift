@@ -260,6 +260,16 @@ extension HLSVideoEngine {
             recordVODVideoConfigurationMismatch(prod, summary: summary)
             return
         }
+        if case .eof = reason, !isLiveSession,
+           let end = prod.observedVideoSourceEndSeconds {
+            restartLock.lock()
+            confirmedEOFSourceEndSeconds = max(confirmedEOFSourceEndSeconds ?? end, end)
+            restartLock.unlock()
+            if let pending = recoverySeekTargetProvider?(), seekIsBeyondKnownSourceEnd(itemSeconds: pending) {
+                surfaceVODSourceFailure(FFmpegErr.eof, "Source ended before the requested seek position")
+                return
+            }
+        }
         // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
@@ -355,16 +365,19 @@ extension HLSVideoEngine {
         // (the unproducible tail segment of rrgomes' DV MKV). Re-anchor on the last keyframe the
         // gate dropped instead of returning, which would leave the forward-wait escalation
         // restarting into the same starve.
-        if case .eof = reason, Self.shouldReanchorVODAfterGateStarvation(
+        if case .eof = reason, Self.seekGateExhausted(
             isLive: isLiveSession,
             videoGateOpened: prod.videoGateOpened,
-            hadRestartTarget: prod.hasRestartTarget,
-            lastDroppedKeyframePts: prod.lastPregateDroppedKeyframePts
+            hadRestartTarget: prod.hasRestartTarget
         ) {
-            // Falls through when the re-anchor is spent or has nowhere to aim, so a session that
-            // produced nothing still reaches the terminal surface below instead of the bare return
-            // this arm used to end on.
-            if handleVODGateStarvationExit(prod) { return }
+            // A cached startup segment cannot satisfy this target. With no real keyframe there
+            // is no recovery anchor; otherwise give the bounded last-keyframe recovery a chance.
+            if prod.lastPregateDroppedKeyframePts == Int64.min {
+                surfaceVODSourceFailure(FFmpegErr.eof, "Source ended before the requested seek position")
+            } else {
+                handleVODGateStarvationExit(prod)
+            }
+            return
         }
         // Sequential append playlist: TRUE source EOF (not a stop, not a re-anchor) completes
         // the playlist with ENDLIST so AVPlayer can reach end-of-media - a growing playlist
@@ -643,6 +656,12 @@ extension HLSVideoEngine {
         let attempts = gateStarvationReviveGate.attempts
         let cap = gateStarvationReviveGate.maxAttempts
         restartLock.unlock()
+        let recoveryIndex = Self.planSegmentIndex(forSourcePts: lastKeyPts, plan: plan)
+        // Previously cached startup segments do not make this exhausted target playable.
+        // Surface the failure even when the session had produced media before the seek.
+        if Self.gateStarvationIsTerminal(recoveryAdmitted: admitted, recoveryIndex: recoveryIndex) {
+            surfaceVODSourceFailure(FFmpegErr.eof, "Source ended before the requested seek position")
+        }
         guard admitted else {
             EngineLog.emit(
                 "[HLSVideoEngine] #169 VOD gate-starvation re-anchor cap reached "
@@ -652,7 +671,7 @@ extension HLSVideoEngine {
             )
             return false
         }
-        guard let idx = Self.planSegmentIndex(forSourcePts: lastKeyPts, plan: plan) else {
+        guard let idx = recoveryIndex else {
             EngineLog.emit(
                 "[HLSVideoEngine] #169 VOD gate starved to EOF but the dropped keyframe "
                 + "(pts=\(lastKeyPts)) maps to no plan segment; not re-anchoring",
@@ -668,6 +687,14 @@ extension HLSVideoEngine {
         )
         requestRestart(at: idx, authoritative: true)
         return true
+    }
+
+    static func seekGateExhausted(isLive: Bool, videoGateOpened: Bool, hadRestartTarget: Bool) -> Bool {
+        !isLive && !videoGateOpened && hadRestartTarget
+    }
+
+    static func gateStarvationIsTerminal(recoveryAdmitted: Bool, recoveryIndex: Int?) -> Bool {
+        !recoveryAdmitted || recoveryIndex == nil
     }
 
     /// AE#222: rebuild the session with the captured audio frame as the muxer's moov prime.

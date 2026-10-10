@@ -903,6 +903,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// scan-forward gate starved to EOF (no runtime keyframe at/after the targeted plan boundary,
     /// the unproducible tail segment). Same gate shape as #99.
     var gateStarvationReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+    /// Only a genuine demux EOF may establish this bound, never an index, header duration,
+    /// backpressure park or interrupted read. Protected by restartLock.
+    var confirmedEOFSourceEndSeconds: Double?
+
+    func seekIsBeyondKnownSourceEnd(itemSeconds: Double) -> Bool {
+        guard !isLiveSession else { return false }
+        restartLock.lock()
+        let end = confirmedEOFSourceEndSeconds
+        restartLock.unlock()
+        return Self.seekExceedsConfirmedEOF(itemSeconds: itemSeconds,
+                                           shiftSeconds: playlistShiftSeconds,
+                                           sourceEndSeconds: end)
+    }
+
+    static func seekExceedsConfirmedEOF(itemSeconds: Double, shiftSeconds: Double,
+                                        sourceEndSeconds: Double?) -> Bool {
+        guard let end = sourceEndSeconds, end.isFinite, itemSeconds.isFinite,
+              shiftSeconds.isFinite else { return false }
+        return itemSeconds + shiftSeconds > end + 0.1
+    }
+
 
     /// #93 residual: a stalled AVPlayer sometimes never resumes REQUESTING after a wedge re-anchor
     /// (device: plain playback, one -15628 errorLog, then zero segment GETs while parked in
@@ -2754,6 +2775,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
         savedAudioConfig = nil
+        confirmedEOFSourceEndSeconds = nil
         let ownedParams = ownedCodecParams
         ownedCodecParams = []
         let reopening = reopenDemuxer

@@ -2115,6 +2115,14 @@ final class NativeAVPlayerHost {
         return false
     }
 
+    /// Source failure ends the landing wait immediately. Fence the cancelled completion before
+    /// asking AVPlayer to cancel, so it cannot publish the requested time as a rendered frame.
+    func cancelSeekForTerminalSourceFailure() {
+        seekGeneration &+= 1
+        seekInFlight = false
+        avPlayer.currentItem?.cancelPendingSeeks()
+    }
+
     /// Un-gate the periodic observer without asserting a landing (cancellation / give-up paths).
     private func releaseSeekGate() {
         seekInFlight = false
