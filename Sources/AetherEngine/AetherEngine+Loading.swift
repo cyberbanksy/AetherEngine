@@ -293,7 +293,12 @@ extension AetherEngine {
             .store(in: &cancellables)
         failure
             .compactMap { $0 }
-            .sink { [weak self] info in self?.publishError(info) }
+            .sink { [weak self] info in
+                guard let self else { return }
+                self.publishError(info)
+                self.finishSeekAfterTerminalSourceEvent()
+                self.nativeHost?.cancelSeekForTerminalSourceFailure()
+            }
             .store(in: &cancellables)
         didReachEnd
             .filter { $0 }
@@ -305,6 +310,7 @@ extension AetherEngine {
                 // a dead session for the rest of the tune.
                 if self.handleLiveOutageWindowExhausted() { return }
                 self.state = .ended
+                self.finishSeekAfterTerminalSourceEvent()
             }
             .store(in: &cancellables)
     }
@@ -898,6 +904,8 @@ extension AetherEngine {
                 self.publishError(PlaybackErrorInfo(kind: kind,
                                                     message: "\(reason) (code \(code))",
                                                     underlyingCode: Int(code)))
+                self.finishSeekAfterTerminalSourceEvent()
+                self.nativeHost?.cancelSeekForTerminalSourceFailure()
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().

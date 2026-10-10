@@ -1602,7 +1602,7 @@ final class NativeAVPlayerHost {
                 }
             }
             // Zero tolerances: unbounded tolerances caused AVPlayer to land on arbitrary sync samples for loopback HLS-fMP4 (openradar 44904505).
-            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard let self else {
                         if resumeGuard.claim() { cont.resume(returning: true) }
@@ -1610,8 +1610,8 @@ final class NativeAVPlayerHost {
                     }
                     // Settle the clock on a real landing even if the deadline already returned (late landing).
                     // Superseded seek: leave the newer generation's flags intact.
-                    if gen == self.seekGeneration {
-                        self.seekInFlight = false
+                    if gen == self.seekGeneration { self.seekInFlight = false }
+                    if gen == self.seekGeneration, finished {
                         let landed = self.avPlayer.currentTime().seconds
                         if landed.isFinite {
                             self.currentTime = landed
@@ -1630,7 +1630,7 @@ final class NativeAVPlayerHost {
                             }
                         }
                     }
-                    if resumeGuard.claim() { cont.resume(returning: true) }
+                    if resumeGuard.claim() { cont.resume(returning: finished) }
                 }
             }
         }
@@ -1707,6 +1707,14 @@ final class NativeAVPlayerHost {
         // caller returns immediately afterwards, so nothing else would ever clear it.
         releaseSeekGate()
         return false
+    }
+
+    /// Source failure ends the landing wait immediately. Fence the cancelled completion before
+    /// asking AVPlayer to cancel, so it cannot publish the requested time as a rendered frame.
+    func cancelSeekForTerminalSourceFailure() {
+        seekGeneration &+= 1
+        seekInFlight = false
+        avPlayer.currentItem?.cancelPendingSeeks()
     }
 
     /// Un-gate the periodic observer without asserting a landing (cancellation / give-up paths).

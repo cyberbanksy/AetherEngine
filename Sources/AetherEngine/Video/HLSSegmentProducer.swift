@@ -402,6 +402,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Last valid dts per stream (source TB); used to repair NOPTS dts via lastValidDts+1.
     private var lastVideoSourceDts: Int64 = Int64.min
+    /// Pump-thread only; read by handlePumpFinished on this same thread. Includes packets
+    /// discarded by the seek gate, so a truncated file's actual extent is still known.
+    private(set) var observedVideoSourceEndSeconds: Double?
+
     private var lastAudioSourceDts: Int64 = Int64.min
 
     /// AE#432: last GENUINE source dts per stream and the frame stride learned from it. A repaired
@@ -2902,6 +2906,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // is WRONG for B-frames (pts < dts in decode order). Fix: lastValidDts+1.
                 // Origin-aware classification: side audio index can alias main video index in dual-demuxer sessions.
                 let isVideoPkt = origin == .main && (pktStreamIdx == videoStreamIndex)
+                if isVideoPkt, packet.pointee.pts != Int64.min {
+                    let end = Double(packet.pointee.pts) * sourceVideoTbSeconds
+                        + Double(max(0, packet.pointee.duration)) * sourceVideoTbSeconds
+                    if end.isFinite {
+                        observedVideoSourceEndSeconds = max(observedVideoSourceEndSeconds ?? end, end)
+                    }
+                }
+
                 let isAudioPkt: Bool
                 if sideAudioDemuxer != nil {
                     isAudioPkt = origin == .side
