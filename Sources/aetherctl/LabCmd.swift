@@ -19,8 +19,8 @@ import AetherEngine
 // bypass) an AVPlayerItemVideoOutput is attached to the engine's item and polled
 // at 250 Hz, which is what makes AVPlayer decode and present headless and gives
 // every presented frame (item PTS, wall time, mean luma). On the software route the
-// engine's own frame-time observer reports every frame the host enqueues, and the
-// presentation timebase is polled to catch the display running dry.
+// engine's observer records enqueue times separately. Timebase polling estimates
+// when queued frames become due and detects starvation; it does not observe pixels.
 //
 // URLs are never echoed into the result or the log: a debrid or tokenised origin
 // must not leak into a scoreboard someone pastes into an issue.
@@ -40,7 +40,7 @@ struct LabConfig {
     var verbose = false
 }
 
-/// One presented (native) or enqueued (software) video frame.
+/// One native output, software enqueue, or software due-presentation estimate.
 struct LabFrame {
     let wall: Double        // CACurrentMediaTime()
     let pts: Double         // item time (native) or source PTS (software)
@@ -151,21 +151,56 @@ func labMeanLuma(_ pb: CVPixelBuffer) -> Double? {
     return max(0, min(1, (sum / n - 16) / 219))
 }
 
-/// Software route only: watches the presentation timebase run past the last enqueued frame,
-/// which is the display running dry (a freeze the enqueue stream alone cannot show).
+/// Software frames are often enqueued seconds ahead in batches. An enqueue gap is not
+/// a presentation freeze. Consume them only once their PTS is due on a running timebase.
+/// This is a headless estimate, not evidence that a pixel reached a display layer.
+struct LabPresentationQueue {
+    private var pending: [LabFrame] = []
+    private var generation: UInt64?
+
+    mutating func consume(_ enqueued: [LabFrame], at time: Double, rate: Double, wall: Double) -> [LabFrame] {
+        for frame in enqueued where frame.pts.isFinite {
+            if let generation, frame.generation < generation { continue }
+            if generation != frame.generation {
+                generation = frame.generation
+                pending.removeAll(keepingCapacity: true)
+            }
+            pending.append(frame)
+        }
+        guard time.isFinite, rate > 0 else { return [] }
+        pending.sort { $0.pts < $1.pts }
+        let due = pending.prefix { $0.pts <= time }
+        let output = due.map { LabFrame(wall: wall, pts: $0.pts, generation: $0.generation, luma: nil) }
+        pending.removeFirst(output.count)
+        return output
+    }
+}
+
+/// Software route only: derives due presentation from the clock while separately
+/// watching the newest enqueue PTS for starvation. Neither proves pixel-layer output.
 final class LabTimebaseWatcher: @unchecked Sendable {
     private let lock = NSLock()
     private var timebase: CMTimebase?
     private let queue = DispatchQueue(label: "aetherctl.lab.tb", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
-    private let recorder: LabFrameRecorder
-    private(set) var starvedMs: Double = 0
+    private let enqueued: LabFrameRecorder
+    private let presented: LabFrameRecorder
+    private var enqueueIndex = 0
+    private var presentationQueue = LabPresentationQueue()
+    private var starvedMs: Double = 0
     private var starveStart: Double?
-    private(set) var starveEvents = 0
-    private(set) var maxStarveMs: Double = 0
-    var interval: Double = 1.0 / 24
+    private var starveEvents = 0
+    private var maxStarveMs: Double = 0
+    private var frameInterval: Double = 1.0 / 24
+    var interval: Double {
+        get { lock.lock(); defer { lock.unlock() }; return frameInterval }
+        set { lock.lock(); frameInterval = newValue; lock.unlock() }
+    }
 
-    init(recorder: LabFrameRecorder) { self.recorder = recorder }
+    init(enqueued: LabFrameRecorder, presented: LabFrameRecorder) {
+        self.enqueued = enqueued
+        self.presented = presented
+    }
 
     func set(_ tb: CMTimebase?) { lock.lock(); timebase = tb; lock.unlock() }
 
@@ -181,7 +216,8 @@ final class LabTimebaseWatcher: @unchecked Sendable {
 
     func snapshot() -> (events: Int, totalMs: Double, maxMs: Double) {
         lock.lock(); defer { lock.unlock() }
-        return (starveEvents, starvedMs, maxStarveMs)
+        let ongoing = starveStart.map { (CACurrentMediaTime() - $0) * 1000 } ?? 0
+        return (starveEvents, starvedMs + ongoing, max(maxStarveMs, ongoing))
     }
 
     func reset() {
@@ -189,19 +225,34 @@ final class LabTimebaseWatcher: @unchecked Sendable {
     }
 
     private func tick() {
-        lock.lock(); let tb = timebase; lock.unlock()
-        guard let tb, CMTimebaseGetRate(tb) > 0, let last = recorder.last else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard let tb = timebase else { return }
+        let rate = CMTimebaseGetRate(tb)
         let now = CACurrentMediaTime()
         let tbTime = CMTimebaseGetTime(tb).seconds
-        lock.lock(); defer { lock.unlock() }
-        if tbTime > last.pts + 2 * interval {
-            if starveStart == nil { starveStart = now; starveEvents += 1 }
-        } else if let s = starveStart {
-            let ms = (now - s) * 1000
-            starvedMs += ms
-            maxStarveMs = max(maxStarveMs, ms)
-            starveStart = nil
+        let fresh = enqueued.slice(from: enqueueIndex)
+        enqueueIndex += fresh.count
+        for frame in presentationQueue.consume(fresh, at: tbTime, rate: rate, wall: now) {
+            presented.append(frame)
         }
+        guard rate > 0, let last = enqueued.last else {
+            finishStarvation(at: now)
+            return
+        }
+        if tbTime > last.pts + 2 * frameInterval {
+            if starveStart == nil { starveStart = now; starveEvents += 1 }
+        } else {
+            finishStarvation(at: now)
+        }
+    }
+
+    // Called with lock held.
+    private func finishStarvation(at now: Double) {
+        guard let start = starveStart else { return }
+        let ms = (now - start) * 1000
+        starvedMs += ms
+        maxStarveMs = max(maxStarveMs, ms)
+        starveStart = nil
     }
 }
 
@@ -310,14 +361,61 @@ func labSeek(_ engine: AetherEngine, to target: Double, timeout: Double) async -
     }
     let deadline = labNow() + timeout
     while !done.value && labNow() < deadline {
+        if labTerminalState(engine) != nil { break }
         try? await Task.sleep(nanoseconds: 10_000_000)
     }
     if !done.value { task.cancel() }
     return done.value
 }
 
+@MainActor
+private func labTerminalState(_ engine: AetherEngine) -> String? {
+    if engine.state == .ended { return "ended" }
+    if case .error = engine.state { return "error" }
+    return nil
+}
+
+/// Deterministic CLI regression checks, independent of decoders and wall-clock sleeps.
+/// Invoke `aetherctl lab --self-test` in the same executable used for measurements.
+private func labSelfTest() -> Int32 {
+    var failures: [String] = []
+    func check(_ condition: Bool, _ message: String) {
+        if !condition { failures.append(message) }
+    }
+    var queue = LabPresentationQueue()
+    let batch = (0..<49).map { LabFrame(wall: 100, pts: Double($0) / 24, generation: 1, luma: nil) }
+    var presented = queue.consume(batch, at: 0, rate: 1, wall: 100)
+    for tick in 1...200 {
+        presented += queue.consume([], at: Double(tick) / 100, rate: 1, wall: 100 + Double(tick) / 100)
+    }
+    let continuity = LabContinuity.analyze(presented, interval: 1.0 / 24)
+    check(presented.count == 49 && continuity.freezes == 0 && continuity.maxFrameGapMs < 51,
+          "batched enqueue must present progressively without a false freeze")
+    let future = LabFrame(wall: 102, pts: 10, generation: 1, luma: nil)
+    check(queue.consume([future], at: 10, rate: 0, wall: 102).isEmpty,
+          "stopped timebase must not count queued frames as presented")
+    let nextGeneration = LabFrame(wall: 103, pts: 3, generation: 2, luma: nil)
+    let landing = queue.consume([nextGeneration], at: 3, rate: 1, wall: 103)
+    check(landing.count == 1 && landing.first?.generation == 2,
+          "new seek generation must discard old queued presentation")
+    check(queue.consume([], at: 11, rate: 1, wall: 104).isEmpty,
+          "discarded generation must never reappear after seek")
+    var stalled = LabPresentationQueue()
+    let start = stalled.consume([LabFrame(wall: 0, pts: 0, generation: 1, luma: nil)], at: 0, rate: 1, wall: 0)
+    let end = stalled.consume([LabFrame(wall: 1, pts: 1, generation: 1, luma: nil)], at: 1, rate: 1, wall: 1)
+    check(LabContinuity.analyze(start + end, interval: 1.0 / 24).freezes == 1,
+          "real absence of due frames must preserve the freeze threshold")
+    if failures.isEmpty {
+        print("LAB self-test: 5 checks passed")
+        return 0
+    }
+    failures.forEach { print("LAB self-test FAILED: \($0)") }
+    return 1
+}
+
 func runLab(arguments: [String]) -> Int32 {
     var rest = arguments
+    if takeFlag("--self-test", from: &rest) { return labSelfTest() }
     var cfg = LabConfig(url: URL(fileURLWithPath: "/"))
     cfg.playSeconds = takeDoubleFlag("--seconds", from: &rest) ?? cfg.playSeconds
     cfg.openTimeout = takeDoubleFlag("--open-timeout", from: &rest) ?? cfg.openTimeout
@@ -395,9 +493,10 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
 
     let recorder = LabFrameRecorder()
     let poller = LabNativeFramePoller(recorder: recorder)
-    let tbWatcher = LabTimebaseWatcher(recorder: recorder)
+    let enqueued = LabFrameRecorder()
+    let tbWatcher = LabTimebaseWatcher(enqueued: enqueued, presented: recorder)
     engine.setSoftwareVideoFrameTimeObserver { @Sendable frame in
-        recorder.append(LabFrame(wall: labNow(), pts: frame.presentation.seconds,
+        enqueued.append(LabFrame(wall: labNow(), pts: frame.presentation.seconds,
                                  generation: frame.generation, luma: nil))
     }
 
@@ -503,7 +602,12 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
     }
 
     let isVideo = engine.videoRoute != .audio && engine.videoRoute != .none
+    if engine.videoRoute == .software { result["softwarePresentation"] = "timebaseDueEstimate" }
+    result["frameEvidence"] = engine.videoRoute == .software
+        ? "software-timebase-due-estimate (headless; no pixel-layer evidence)"
+        : "AVPlayerItemVideoOutput"
     if engine.videoRoute == .software {
+        tbWatcher.interval = engine.sourceVideoFrameRate.flatMap { $0 > 1 ? 1 / $0 : nil } ?? (1.0 / 24)
         tbWatcher.set(engine.softwarePresentationTimebase)
         tbWatcher.start()
     }
@@ -587,6 +691,7 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
     if let dropped = telemetry?.droppedFrameCount { play["engineDroppedFrames"] = dropped }
     if let fps = telemetry?.observedFps { play["engineObservedFps"] = labRound(fps) }
     if engine.videoRoute == .software {
+        play["enqueueContinuity"] = LabContinuity.analyze(enqueued.between(windowStart, windowEnd), interval: interval).json
         let s = tbWatcher.snapshot()
         play["displayStarvation"] = ["events": s.events, "totalMs": labRound(s.totalMs, 10), "maxMs": labRound(s.maxMs, 10)]
     }
@@ -618,6 +723,7 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
             var landing: LabFrame?
             let landDeadline = returned + cfg.seekTimeout
             while landing == nil && labNow() < landDeadline {
+                if engine.videoRoute == .software { tbWatcher.set(engine.softwarePresentationTimebase) }
                 for f in recorder.slice(from: preIndex) where f.wall >= issued {
                     let far: Bool
                     if let preLast {
@@ -629,8 +735,16 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
                     }
                     if far || f.wall >= returned + 0.05 { landing = f; break }
                 }
-                if landing == nil { try? await Task.sleep(nanoseconds: 5_000_000) }
+                if landing == nil {
+                    if let terminal = labTerminalState(engine) {
+                        s["terminalNoFrame"] = terminal
+                        s["terminalNoFrameMs"] = labRound((labNow() - issued) * 1000, 10)
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 5_000_000)
+                }
             }
+            s["landingWaitMs"] = labRound((labNow() - returned) * 1000, 10)
             if let landing {
                 s["landed"] = true
                 // Starvation is judged from the landing on: the hold while the seek itself is in
@@ -659,6 +773,7 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
                 s["landedClock"] = labRound(clockAtLanding)
                 s["landingErrorS"] = labRound(clockAtLanding - target)
                 if engine.videoRoute == .software {
+                    s["enqueueContinuity"] = LabContinuity.analyze(enqueued.between(landing.wall, landing.wall + cfg.postSeekWindow), interval: interval).json
                     let st = tbWatcher.snapshot()
                     s["displayStarvation"] = ["events": st.events, "totalMs": labRound(st.totalMs, 10), "maxMs": labRound(st.maxMs, 10)]
                 }
@@ -675,6 +790,7 @@ private func labMeasure(_ cfg: LabConfig) async -> [String: Any] {
                 break
             }
             seeks.append(s)
+            if engine.state == .ended { break }
         }
     }
     result["seeks"] = seeks
