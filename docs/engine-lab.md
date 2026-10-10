@@ -11,12 +11,12 @@ It has three parts:
 | corpus | `Scripts/engine-lab/corpus.json`, `fetch_corpus.py` | the manifest, plus a fetcher/generator for public and generated media |
 | debrid quirks | `Scripts/engine-lab/quirk_server.py` | an HTTP origin that misbehaves the way debrid / CDN links do |
 
-No media is committed. The corpus lives on the internal disk at `~/Developer/openstream-build/engine-lab/corpus` (`ENGINE_LAB_CORPUS` overrides it). Runs go to `~/Developer/openstream-build/engine-lab/runs/<stamp>-<label>/` (`ENGINE_LAB_HOME` overrides the parent). The fetcher stops at 40 GB. The current corpus is about 4.4 GB.
+No media is committed. The corpus and runs live on Dev-Mini at `/Volumes/DevExt/engine-lab/`; verify `/Volumes/DevExt/.devext-ok` first. `~/Developer/openstream-build/engine-lab` points there. Set `ENGINE_LAB_CORPUS=/Volumes/DevExt/engine-lab/corpus` and `ENGINE_LAB_HOME=/Volumes/DevExt/engine-lab`. The fetcher stops at 40 GB. The current corpus is about 4.4 GB.
 
 ## Running it
 
 ```bash
-swift build --product aetherctl                       # the lab uses the debug aetherctl
+~/Developer/bin/buildlock.sh swift build --scratch-path ~/Developer/openstream-build/aether-fork-spm --product aetherctl # on Dev-Mini
 python3 Scripts/engine-lab/fetch_corpus.py            # download + generate (cached; --force to redo, --only id,id)
 python3 Scripts/engine-lab/lab.py run --label baseline
 python3 Scripts/engine-lab/lab.py run --label fix-x --only q-range-ignored,g-mkv-nocues   # re-run a subset
@@ -61,7 +61,7 @@ Every source runs in its own `aetherctl` process. A crash or a wedge costs that 
 How frames are observed without a screen:
 
 - **Native routes (loopback, remote bypass).** An `AVPlayerItemVideoOutput` (8-bit 4:2:0) is attached to the engine's `currentAVPlayerItem` and re-attached whenever the engine swaps the item. It is polled at 250 Hz. Every presented frame is recorded with its item PTS, wall time and mean luma on a 16×9 grid. The attached output is also what makes AVPlayer decode and present without a layer in a window.
-- **Software route.** The engine's `setSoftwareVideoFrameTimeObserver` reports every frame the host enqueues (PTS + decode generation). The presentation timebase is polled at 100 Hz, and a timebase that runs more than two frames past the last enqueued frame is counted as **display starvation**. That is the software-route freeze the enqueue stream alone cannot show.
+- **Software route.** The engine observer records enqueue times separately (`enqueueContinuity`). A generation-aware PTS queue and 100 Hz presentation-timebase polling estimate when those frames become due (`softwarePresentation=timebaseDueEstimate`). A running timebase more than two frames beyond the newest enqueue PTS counts as starvation, including an ongoing interval at measurement end. This estimates due presentation and does not observe pixel-layer output. Decoder enqueue bursts and pauses alone are not display freezes.
 
 The seek landing frame is the first frame after the seek call that is more than 0.5 s from the pre-seek playhead (software: of a newer decode generation). Failing that, it is the first frame that arrives after `seek()` returned. "Black flash" means a frame with mean luma < 0.06 within 500 ms of the landing, in a window whose picture settles above 0.15 after one second. That is the Strand-style "black frame / stutter after seek" report expressed as a number.
 
@@ -88,7 +88,7 @@ They are set in `THRESHOLDS` at the top of `lab.py`. Edit them there and `rescor
 
 Sources of 10 s or shorter skip the seeks (targets are clamped to end 5.5 s before the end, because reaching end of media ends the session). Live sources skip them too.
 
-Muse research (notes 26/27, unverified) suggests tighter targets: A/V ≤ 40 ms nominal / 80 ms after a seek, and time to first frame < 3 s for a 70 GB DV P7 MKV over SMB. Our presented-vs-clock number is quantised to one 100 ms sample of the frame stream, so 100 ms is the honest floor for now.
+Muse research (notes 26/27, unverified) suggests tighter targets: A/V ≤ 40 ms nominal / 80 ms after a seek, and time to first frame < 3 s for a 70 GB DV P7 MKV over SMB. The software drift number still compares due-frame timestamps with the engine's periodically published clock; clock publication quantization can produce roughly 120 ms flags. Keep those flags and the unchanged 100 ms threshold visible rather than claiming measured A/V output synchronization.
 
 ## Corpus
 
@@ -202,7 +202,7 @@ Fixes, each with a regression test:
 - **Seek during the end-of-file drain (software route).** A seek that arrives during the drain no longer ends the session. Every backward seek after a read-to-EOF had ended playback.
 - **Seek axis (software route).** Seeks now use the source axis. A TS whose PTS starts at 23 000 s never presented a frame after a seek.
 
-Open items, worst first:
+Open items from the first run, worst first (round 2 status below):
 
 - **Seek stutter on software AV1.** The clock restarts before decode has a cushion, so the display starves for 100-1000 ms after each seek (`jf-av1-*`). This needs a post-seek preroll gate.
 - **Truncated or partial files.** On a file with a declared duration past the end of its data, a seek past the data never lands and stalls for 12 s (`ff-eac3-mkv`, `ff-vobsub-largeres`, `g-mkv-truncated`, `ff-lalaland-4k-hdr`). It should land at the data's end, or end the session.
@@ -215,3 +215,79 @@ Open items, worst first:
   - The TS PTS-wrap row's 90 % seek never lands.
   - After a 403 expiry, the 90 % seek never lands. It should surface an error.
   - RealVideo (`ff-mkv-size-change`) is unsupported by design.
+
+
+## Round 2 (2026-10-10)
+
+The unchanged-engine baseline is `ae63b543`: that commit corrects the harness before measuring any engine fix. All 98 entries were available, with no skips; downloaded/generated media occupies 4.37 GB on DevExt. The engine changes tested afterward are `c54f0270` (codec/filter EOF drain), `0229b844` (truncated native seeks), `5fbcade3` (software seek preroll and final video tail), and `45d64e8a` (keep raw EOF bounds off wrapped/folded timelines). Full fork tests pass 2,656 tests / 359 suites with `--no-parallel`; parallel runs reproduce the existing shared EngineLog-handler races.
+
+The complete baseline is `runs/20261010-031451-round2-full-baseline`. Forced-software AV1 uses `runs/20261010-034353-round2-av1-forced-baseline` and `runs/20261010-034953-round2-av1-forced-after`; every result reports route `software`. Automatic routing on the M4 uses hardware and does not reproduce the original software seek issue. The forced runs add `--sw` to the four AV1 manifest entries through a temporary runner wrapper; individual measurements are repeatable with `aetherctl lab --sw <file>`.
+
+| Targeted measurement | Before | After |
+|---|---:|---:|
+| AV1 seek continuity | 1/4 fixtures pass | 4/4 |
+| AV1 post-seek starvation | 9/12 seeks, 131.2–700 ms | 0/12 |
+| AV1 median frame latency | 231.35 ms | 289.2 ms |
+| AV1 maximum frame latency | 905.3 ms | 939.2 ms |
+| Interlaced play freezes (six fixtures) | 0 | 0 |
+| Interlaced post-seek freezes (18 seeks) | 0 | 0 |
+| VC-1 published final clock | 0.751 s | 1.034 s |
+
+The AV1 gate parks the clock while the decoder builds a 150 ms runway, with a full-renderer escape and a 1.5 s cap. It respects transport intent, cancellation, and seek generation. All twelve seeks remain under the original 1.5 s latency limit. Steady-play frame scores remain 3/4 and drift remains 1/4; those are not claimed fixed.
+
+The original interlaced freeze flag came from decoder enqueue gaps. All six clips already have zero play freezes/starvation and all eighteen seeks have zero freezes with the corrected baseline harness. Decoder EOF draining now preserves temporal-filter lookahead, but no genuine interlaced display freeze was reproduced. MBAFF still exceeds the 2.5 s TTFF and 1.5 s seek limits in the targeted after run (2.625 s; 1,721.6 ms for the 10% seek).
+
+The VC-1 file is only 376,832 bytes and is intrinsically truncated: FFmpeg decodes 32 video pictures through PTS 1.034 s despite a 7.007 s header. Draining the codec/filter and waiting for the queued video frontier recovers that observable tail. The duration-based playback score correctly remains FAIL; the absent six seconds cannot be recovered.
+
+`runs/20261010-035753-round2-truncated-final` verifies all four partial-file cases. VobSub, La La Land and E-AC-3 impossible targets end in 10.6–12.3 ms; the generated truncated MKV's valid 50% seek lands in 108.4 ms, then its impossible 90% target ends in 10.4 ms. Landing waits are 0–0.1 ms. Before, these paths consumed one or two 12 s waits per target. Bounds are established only by actual demux EOF and observed video packet extent on Matroska without timeline folding; header duration, a buffering park, and an interrupted read cannot establish them. Raw packet PTS do not bound MPEG-TS, MP4, unknown containers, or folded timelines. The timestamp-wrap regression found during the first after attempt is excluded by this guard; the targeted verification keeps its 50% seek valid at 86.2 ms; the unproducible 90% target ends in 69.4 ms. No fake landed frame or requested target clock is published for the failed seek.
+
+| Missing-data target: seek return plus landing wait | Before | After terminal error |
+|---|---:|---:|
+| VobSub 50% | 12,084 ms | 12.3 ms |
+| La La Land 50% | 12,110 ms | 10.7 ms |
+| E-AC-3 50% | 24,008 ms | 10.6 ms |
+| Generated truncated MKV 90% | 12,085 ms | 10.4 ms |
+
+These are wall times from the issued seek through the landing wait, not claims of a decoded landing. The baseline E-AC-3 spends 12 s in the engine seek and another 12 s in the harness; the others falsely report a completed native seek before the missing-frame wait.
+
+Keep the original scoreboard thresholds and failures. `seek_latency` requires a landed frame, so a prompt error at missing media still scores FAIL. Its global `stateErrors` also makes `playback` FAIL for an error issued during a later seek, even when the six-second play window was healthy. Inspect phase measurements and terminal timings alongside those aggregate marks.
+
+
+### AV1 trace coverage
+
+The usable before/after recordings are `/Volumes/DevExt/engine-lab/av1-{before,after}-attached.trace`, with TOC, `time-profile` XML, CLI JSON and logs beside them. The frozen before binary contains unchanged `c9c5cf3d` engine code and the original harness; the after binary contains `5fbcade3` software engine code and the corrected harness. Both run the same local 1080p AV1 source with `--sw`, a six-second play window and three seeks, and both processes and profiler recordings exit 0. Attachment avoids the separate launch recordings' unproductive load/wait phase.
+
+| Running-sample measure | Before | After |
+|---|---:|---:|
+| Covered sample span | 14.069 s | 14.638 s |
+| Summed CPU weight | 23.721 CPU-s | 24.441 CPU-s |
+| Mean sampled CPU | 1.686 cores | 1.670 cores |
+| dav1d self weight/share | 19.643 s / 82.81% | 20.219 s / 82.73% |
+| swscale self weight/share | 2.770 s / 11.68% | 2.896 s / 11.85% |
+| Main Thread weight | 57 ms | 50 ms |
+
+Both recordings cover ten dav1d workers, software host/decoder work, and successful execution of all three seeks. Decoder work dominates; the fix adds a short clock hold rather than removing CPU decode work. Attachment coverage and harness versions differ, so these samples do not establish a CPU improvement. The earlier `av1-{before,after}.trace` launch recordings have no decoder coverage and are excluded from decoder conclusions.
+
+
+### Complete 98-source comparison
+
+The final run is `runs/20261010-041939-round2-full-final`, engine `45d64e8a`, compared with the unchanged-engine corrected-harness baseline `runs/20261010-031451-round2-full-baseline` at `ae63b543`. Both use six-second play windows, three seeks, all 98 entries, zero skips, and identical thresholds. The interrupted `round2-full-after` attempt is diagnostic evidence of the timestamp-wrap bound regression, not the final comparison.
+
+| Metric | Baseline | Final |
+|---|---:|---:|
+| crash | 98/98 | 98/98 |
+| open | 97/98 | 97/98 |
+| oracle | 96/98 | 96/98 |
+| ttff | 93/94 | 93/94 |
+| playback | 91/94 | 85/94 |
+| frames | 92/94 | 92/94 |
+| seek_latency | 70/84 | 70/84 |
+| seek_continuity | 79/82 | 80/82 |
+| av_drift | 73/93 | 71/93 |
+| memory | 98/98 | 98/98 |
+
+The six new playback marks are `ff-embedded-ass`, `ff-mkv-decode-error-stop`, `ff-vobsub-largeres`, `ff-lalaland-4k-hdr`, `g-mkv-truncated`, and `ff-eac3-mkv`. Each has healthy roughly six-second clock advance in both runs, then the final run reports an explicit error on a seek into absent media. The scorer applies those later `stateErrors` to its global playback mark. These are prompt terminal outcomes, not six newly stalled play windows; no scoring rule has been relaxed. Missing-data seeks still fail the landed-frame metric by design.
+
+The drift total has three PASS→FAIL and one FAIL→PASS changes near the software clock-publication limits. The native DV/Atmos sample's continuity changes FAIL→PASS in this single run; do not attribute that fluctuation to software AV1 preroll. The forced-software AV1 run and attached trace establish the requested seek improvement independently of automatic hardware routing in the full corpus.
+
+The final full-run timestamp-wrap 50% seek lands in 82.5 ms; its 90% no-frame tail terminates in 69.7 ms. Interlaced fixtures remain free of measured freezes. Keep real-device pixel output and A12 thermal behavior as separate hardware checks.
