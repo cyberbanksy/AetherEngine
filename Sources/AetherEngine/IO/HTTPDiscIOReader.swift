@@ -278,7 +278,9 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
-                         session: Self.makeSession(nil),
+                         // A fork keeps the host's session configuration (proxy, headers,
+                         // timeouts): `configuration` is a copy of the one this session was made with.
+                         session: Self.makeSession(session.configuration),
                          totalSize: totalSize, residentSpans: residentSpans)
     }
 

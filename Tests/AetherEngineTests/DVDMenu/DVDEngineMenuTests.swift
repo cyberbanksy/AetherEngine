@@ -86,6 +86,43 @@ struct DVDEngineMenuTests {
         #expect(engine.dvdMenu == nil && engine.dvdMenuController == nil)
     }
 
+    @Test("Menu presentation publishes a surface route and supports binding after its first frame",
+          arguments: [("menu-test.iso", 4.0 / 3.0), ("menu-features.iso", 16.0 / 9.0)])
+    func lateBoundMenuSurface(discName: String, aspect: Double) async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: DVDMenuPlayerTests.fixture(discName), options: LoadOptions(dvdStartMode: .menu))
+        let controller = try #require(engine.dvdMenuController)
+        #expect(await waitUntil { controller.framesPresented > 0 && engine.dvdMenu?.isStill == true })
+        #expect(engine.videoRoute == .software)
+        #expect(engine.hasFirstFrameReadyForDisplay)
+        #expect(engine.playbackPhase == .playing)
+        #expect(engine.softwareDisplaySize.map { abs($0.width / $0.height - aspect) < 0.002 } == true)
+        let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 640, height: 480))
+        engine.bind(view: view)
+        #expect(controller.displayLayer.superlayer != nil)
+        let replacement = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        engine.bind(view: replacement)
+        #expect(controller.displayLayer.superlayer != nil)
+        engine.unbind(view: replacement)
+        #expect(controller.displayLayer.superlayer == nil)
+        // Queue callbacks while this actor still owns the session, then tear it down before
+        // the main queue delivers them. They must not revive menu state or frame readiness.
+        controller.performSync { player in
+            player.onSnapshot?(player.snapshot)
+            if let frame = player.lastFrame { player.onFrame?(frame) }
+        }
+        engine.stop()
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        #expect(engine.dvdMenu == nil)
+        #expect(engine.hasFirstFrameReadyForDisplay == false)
+        #expect(engine.hasTransportRolled == false)
+        #expect(engine.softwareDisplaySize == nil)
+        #expect(engine.playbackPhase == .idle)
+    }
+
     @Test("Title plays through the normal engine pipeline and returns to the menu at its end")
     func realPipelineHandOff() async throws {
         let engine = try AetherEngine()
@@ -99,6 +136,8 @@ struct DVDEngineMenuTests {
         #expect(await waitUntil(20) { engine.dvdMenu?.isInMenu == true && engine.dvdMenu?.isStill == true },
                 "state \(engine.state) menu \(String(describing: engine.dvdMenu))")
         #expect(engine.state == .playing)
+        #expect(engine.videoRoute == .software)
+        #expect(await waitUntil { engine.softwareDisplaySize != nil && engine.playbackPhase == .playing })
         engine.stop()
     }
 
@@ -144,8 +183,39 @@ struct DVDEngineMenuTests {
     func nonDiscFallsThrough() async throws {
         let engine = try AetherEngine()
         let notADisc = URL(fileURLWithPath: #filePath)
-        #expect(engine.startDVDMenuSessionIfPossible(source: .url(notADisc), options: LoadOptions(dvdStartMode: .menu)) == false)
+        engine.state = .paused
+        let generation = engine.loadGeneration
+        #expect(try await engine.startDVDMenuSessionIfPossible(source: .url(notADisc), options: LoadOptions(dvdStartMode: .menu)) == false)
         #expect(engine.dvdMenuController == nil)
+        #expect(engine.state == .paused)
+        #expect(engine.loadGeneration == generation)
+    }
+
+    @Test("Skip to Movie keeps a DVD navigator and resumes its interrupted title")
+    func skipKeepsNavigator() async throws {
+        let engine = try AetherEngine()
+        let host = RecordingTitleHost()
+        engine.dvdTitleHostOverride = host
+        _ = try await engine.load(source: .url(DVDMenuPlayerTests.fixture("menu-test.iso")), options: LoadOptions(dvdStartMode: .mainTitle))
+        #expect(await waitUntil { engine.dvdMenu?.isPlayingTitle == true })
+        host.position = 1.5
+        engine.dvdMenu(.title)
+        #expect(await waitUntil { engine.dvdMenu?.isInMenu == true && engine.dvdMenu?.isStill == true })
+        #expect(host.stops == 1)
+        engine.dvdResume()
+        #expect(await waitUntil { host.requests.count == 2 })
+        #expect(host.requests.last?.startCell == 2)
+        engine.stop()
+    }
+
+    @Test("Skip to Movie carries the saved position into its first title load")
+    func skipKeepsSavedPosition() async throws {
+        let engine = try AetherEngine()
+        engine.dvdTitleHostOverride = RecordingTitleHost()
+        _ = try await engine.load(source: .url(iso), startPosition: 1.5, options: LoadOptions(dvdStartMode: .mainTitle))
+        #expect(await waitUntil { engine.dvdMenu?.isPlayingTitle == true })
+        #expect(engine.dvdMenuController?.initialTitlePosition == 1.5)
+        engine.stop()
     }
 
     @Test("Title stream selection: audio substream n maps to its container stream")
