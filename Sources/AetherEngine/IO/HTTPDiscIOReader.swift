@@ -19,6 +19,7 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     private let url: URL
     private let extraHeaders: [String: String]
     private let session: URLSession
+    private let sessionConfiguration: URLSessionConfiguration
     private let requestTimeout: TimeInterval
     private let baseChunkSize: Int
     private let maxChunkSize: Int
@@ -55,11 +56,12 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
         self.currentChunkSize = max(64 * 1024, baseChunkSize)
         self.maxRetries = max(0, maxRetries)
         self.requestTimeout = requestTimeout
-        let config = sessionConfiguration ?? {
+        let config = (sessionConfiguration?.copy() as? URLSessionConfiguration) ?? {
             let c = URLSessionConfiguration.ephemeral
             c.requestCachePolicy = .reloadIgnoringLocalCacheData
             return c
         }()
+        self.sessionConfiguration = config
         self.session = URLSession(configuration: config)
 
         guard let size = Self.probeSize(
@@ -151,7 +153,8 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
     func makeIndependentReader() -> IOReader? {
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
-                         maxRetries: maxRetries, requestTimeout: requestTimeout)
+                         maxRetries: maxRetries, requestTimeout: requestTimeout,
+                         sessionConfiguration: sessionConfiguration)
     }
 
     // MARK: - HTTP

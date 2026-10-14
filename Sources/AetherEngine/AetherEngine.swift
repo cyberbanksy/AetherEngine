@@ -56,7 +56,7 @@ public final class AetherEngine: ObservableObject {
 
     /// Live state of a DVD-Video disc running from its menus (`LoadOptions.dvdStartMode == .menu`):
     /// whether a menu or a title is on screen, the menu's buttons and highlight, title and chapter.
-    /// nil for every other source and for discs played with `.mainTitle`.
+    /// nil for every source without DVD navigation and explicit disc-title loads.
     @Published public internal(set) var dvdMenu: DVDMenuState?
     /// The running DVD menu session, nil outside one.
     var dvdMenuController: DVDMenuController?
@@ -1285,10 +1285,12 @@ public final class AetherEngine: ObservableObject {
         boundView = nil
     }
 
-    /// Attaches nativeHost.playerLayer or softwareHost.displayLayer to the bound view. No-op when no host.
+    /// Attaches the active DVD menu, native player or software display layer to the bound view.
     func presentCurrentLayer() {
         guard let view = boundView else { return }
-        if let host = nativeHost {
+        if let menu = dvdMenuController, menu.titleActive == false {
+            view.attach(menu.displayLayer)
+        } else if let host = nativeHost {
             view.attach(host.playerLayer)
         } else if let host = softwareHost {
             view.attach(host.displayLayer)
@@ -3068,7 +3070,13 @@ public final class AetherEngine: ObservableObject {
         // player; its titles come back through here as custom sources with the hand-off flag set.
         if !dvdTitleHandoffInProgress {
             tearDownDVDMenuSession()
-            if options.dvdStartMode == .menu, startDVDMenuSessionIfPossible(source: source, options: options) {
+            // DVD Skip to Movie keeps navigation alive so Menu/Resume preserves its position.
+            // Explicit title selection still uses the ordinary title path.
+            let discImage: Bool
+            if case .url(let url) = source { discImage = Demuxer.isDiscImageURL(url) }
+            else { discImage = false }
+            if (options.dvdStartMode == .menu || (discImage && discTitleID == nil)),
+               try await startDVDMenuSessionIfPossible(source: source, options: options, startPosition: startPosition) {
                 return nil
             }
         }

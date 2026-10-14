@@ -30,6 +30,8 @@ final class DVDMenuController {
     var titleHost: DVDTitleHost
     private(set) var titleActive = false
     private var stateWatch: AnyCancellable?
+    /// A saved position applies only to the first Skip to Movie title load.
+    var initialTitlePosition: Double?
     /// Pictures that reached the display layer (diagnostics / tests).
     private(set) var framesPresented = 0
     /// Test hook: called on the main actor with each presented picture.
@@ -80,7 +82,9 @@ final class DVDMenuController {
         timer = nil
         stateWatch = nil
         let p = UncheckedBox(player)
+        player.disc.reader.cancel()
         queue.sync { p.value.stop() }
+        player.disc.reader.close()
         if titleActive { titleHost.stopTitle(controller: self); titleActive = false }
         if #available(iOS 17.0, tvOS 17.0, macOS 14.0, visionOS 1.0, *) {
             displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
@@ -123,27 +127,49 @@ final class DVDMenuController {
     }
 
     private func present(_ frame: DVDMenuFrame) {
-        if titleActive { return }
+        guard engine?.dvdMenuController === self, titleActive == false else { return }
         guard let sb = Self.sampleBuffer(frame.pixelBuffer) else { return }
         if #available(iOS 17.0, tvOS 17.0, macOS 14.0, visionOS 1.0, *) {
             displayLayer.sampleBufferRenderer.enqueue(sb)
         }
+        // Menus serve the same sample-buffer surface contract as software playback. Hosts may
+        // bind their view only after the first frame; publish the actual anamorphic display size.
+        if let format = CMSampleBufferGetFormatDescription(sb) {
+            engine?.softwareDisplaySize = CMVideoFormatDescriptionGetPresentationDimensions(
+                format, usePixelAspectRatio: true, useCleanAperture: true)
+        }
+        engine?.hasFirstFrameReadyForDisplay = true
+        // Menu stills have no transport-status publisher; their presented frame is ready playback.
+        engine?.hasTransportRolled = true
         framesPresented += 1
         onPresent?(frame)
     }
 
     private func publish(_ snap: DVDMenuSnapshot) {
+        guard engine?.dvdMenuController === self else { return }
         engine?.dvdMenu = DVDMenuState(snap)
     }
 
     private func startTitle(_ req: DVDTitleRequest) {
-        guard let reader = player.disc.makeReader(.title(vts: req.vts), sectorRanges: req.sectorRanges) else {
-            engine?.dvdMenuSessionEnded(error: "title \(req.title) sectors unreadable")
-            return
-        }
+        guard let engine else { return }
+        let generation = engine.loadGeneration
+        let disc = player.disc
         titleActive = true
         let host = titleHost
         Task { @MainActor in
+            // Forking an HTTP disc reader performs a range probe. Keep it off the UI actor.
+            let reader = await Task.detached(priority: .userInitiated) {
+                disc.makeReader(.title(vts: req.vts), sectorRanges: req.sectorRanges)
+            }.value
+            guard let engine = self.engine, engine.dvdMenuController === self,
+                  self.titleActive, engine.loadGeneration == generation else {
+                reader?.close()
+                return
+            }
+            guard let reader else {
+                engine.dvdMenuSessionEnded(error: "title \(req.title) sectors unreadable")
+                return
+            }
             await host.playTitle(req, reader: reader, controller: self)
         }
     }
@@ -159,6 +185,7 @@ final class DVDMenuController {
 
     /// The pipeline's title session is gone and the menu owns the picture again.
     private func menuTookOver() {
+        engine?.playbackBackend = .software
         attachLayer()
         engine?.state = .playing
     }
@@ -203,7 +230,9 @@ final class EngineDVDTitleHost: DVDTitleHost {
         engine.dvdTitleHandoffInProgress = true
         defer { engine.dvdTitleHandoffInProgress = false }
         do {
-            _ = try await engine.load(source: .custom(reader, formatHint: "mpeg"), options: options,
+            let startPosition = controller.initialTitlePosition
+            controller.initialTitlePosition = nil
+            _ = try await engine.load(source: .custom(reader, formatHint: "mpeg"), startPosition: startPosition, options: options,
                                       audioSourceStreamIndex: audioIndex.map(Int32.init))
         } catch {
             engine.dvdMenuSessionEnded(error: "title load failed: \(error)")
@@ -262,21 +291,59 @@ final class EngineDVDTitleHost: DVDTitleHost {
 extension AetherEngine {
     /// Starts a DVD menu session for `source` when it is a DVD-Video image with navigation data.
     /// Returns false (and leaves the load to the normal path) otherwise.
-    func startDVDMenuSessionIfPossible(source: MediaSource, options: LoadOptions) -> Bool {
-        let reader: IOReader?
-        switch source {
-        case .url(let u): reader = u.isFileURL ? FileIOReader(url: u) : nil
-        case .custom(let r, _): reader = r.makeIndependentReader()
+    func startDVDMenuSessionIfPossible(source: MediaSource, options: LoadOptions,
+                                      httpSessionConfiguration: URLSessionConfiguration? = nil,
+                                      startPosition: Double? = nil) async throws -> Bool {
+        if case .url(let url) = source {
+            guard url.isFileURL || ((url.scheme == "http" || url.scheme == "https")
+                                   && Demuxer.isDiscImageURL(url)) else { return false }
         }
-        guard let reader, DiscReader.looksLikeISO9660(reader), let disc = try? DVDDiscSource(reader: reader),
-              disc.navigation.hasMenus || disc.navigation.vmgi.firstPlayPGC != nil else { return false }
-        tearDownDVDMenuSession()
+        let generation = loadGeneration
+        let headers = options.httpHeaders
+        let configuration = httpSessionConfiguration?.copy() as? URLSessionConfiguration
+        let preparation = Task.detached(priority: .userInitiated) { () throws -> DVDDiscSource? in
+            try Task.checkCancellation()
+            let reader: IOReader?
+            switch source {
+            case .url(let url):
+                reader = url.isFileURL ? FileIOReader(url: url)
+                    : HTTPDiscIOReader(url: url, extraHeaders: headers, sessionConfiguration: configuration)
+            case .custom(let original, _):
+                reader = original.makeIndependentReader()
+            }
+            guard let reader else { return nil }
+            var accepted = false
+            defer { if accepted == false { reader.close() } }
+            guard DiscReader.looksLikeISO9660(reader), let disc = try? DVDDiscSource(reader: reader),
+                  disc.navigation.hasMenus || disc.navigation.vmgi.firstPlayPGC != nil else { return nil }
+            try Task.checkCancellation()
+            accepted = true
+            return disc
+        }
+        var disc: DVDDiscSource?
+        do {
+            disc = try await withTaskCancellationHandler {
+                try await preparation.value
+            } onCancel: {
+                preparation.cancel()
+            }
+            try Task.checkCancellation()
+            try checkLoadCurrent(generation)
+        } catch {
+            disc?.reader.close()
+            throw error
+        }
+        guard let disc else { return false }
+        // An unsupported disc or a cancelled probe must leave current playback untouched.
         stop(resetDisplayCriteria: false, finalTeardown: false)
+        state = .loading
         loadedOptions = options
         let controller = DVDMenuController(engine: self, disc: disc, titleHost: dvdTitleHostOverride)
+        controller.initialTitlePosition = options.dvdStartMode == .mainTitle ? startPosition : nil
         dvdMenuController = controller
+        playbackBackend = .software
         state = .playing
-        controller.start(skipToMainTitle: false)
+        controller.start(skipToMainTitle: options.dvdStartMode == .mainTitle)
         return true
     }
 
