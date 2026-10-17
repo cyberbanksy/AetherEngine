@@ -891,7 +891,7 @@ Replays a synthetic SSAI ad-pod feed through the live-direct-play path to repro 
 
 One engine-lab measurement of one source, written as JSON (`--out r.json`, stdout otherwise). It covers open, probe, route, the first presented frame, a play window (`--seconds`, default 6), seeks to 50 / 90 / 10 % with seek-to-frame latency and post-seek continuity, drift, and the memory peak. Frames are observed headless through an `AVPlayerItemVideoOutput` on the native routes and through the frame-time observer plus the presentation timebase on the software route. The engine is muted. URLs are redacted from everything it records.
 
-`--sw` forces the software route, `--native-hls` the remote-HLS bypass, `--live` the live path, and `--no-seeks` skips the seeks. `--verbose` echoes the engine log.
+`--sw` forces the software route, `--native-hls` the remote-HLS bypass, `--live` the live path, and `--no-seeks` skips the seeks. `--verbose` echoes the engine log. `--open-timeout S` (default 45), `--first-frame-timeout S` (20) and `--seek-timeout S` (12) bound each stage; a stage past its bound is recorded as a failure and the run moves on.
 
 `Scripts/engine-lab/lab.py` runs it over the whole corpus and builds the scoreboard. See [engine-lab.md](engine-lab.md).
 

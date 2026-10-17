@@ -158,7 +158,7 @@ final class DVDMenuController {
         let host = titleHost
         Task { @MainActor in
             // Forking an HTTP disc reader performs a range probe. Keep it off the UI actor.
-            let reader = await Task.detached(priority: .userInitiated) {
+            let reader = await BlockingWork.detached(priority: .userInitiated) {
                 disc.makeReader(.title(vts: req.vts), sectorRanges: req.sectorRanges)
             }.value
             guard let engine = self.engine, engine.dvdMenuController === self,
@@ -301,7 +301,7 @@ extension AetherEngine {
         let generation = loadGeneration
         let headers = options.httpHeaders
         let configuration = httpSessionConfiguration?.copy() as? URLSessionConfiguration
-        let preparation = Task.detached(priority: .userInitiated) { () throws -> DVDDiscSource? in
+        let preparation = BlockingWork.detached(priority: .userInitiated) { () throws -> DVDDiscSource? in
             try Task.checkCancellation()
             let reader: IOReader?
             switch source {

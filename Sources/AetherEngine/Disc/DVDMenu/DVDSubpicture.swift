@@ -245,34 +245,11 @@ enum DVDHighlightRenderer {
     }
 }
 
-/// Reassembles SPUs that the demuxer delivers in several PES payloads (the first two bytes of a unit
-/// give its total size).
-struct DVDSubpictureAssembler: Sendable {
-    private var buffer: [UInt8] = []
-    private var expected = 0
-    private(set) var pts: Int64?
-
-    /// Feeds one payload; returns a complete unit (and the PTS of its first fragment) when one finishes.
-    mutating func feed(_ payload: [UInt8], pts packetPTS: Int64?) -> (unit: [UInt8], pts: Int64?)? {
-        if buffer.isEmpty {
-            guard payload.count >= 2 else { return nil }
-            expected = Int(payload[0]) << 8 | Int(payload[1])
-            pts = packetPTS
-            guard expected >= 4 else { return nil }
-        }
-        buffer += payload
-        guard buffer.count >= expected else { return nil }
-        let unit = Array(buffer.prefix(expected))
-        let p = pts
-        buffer.removeAll(keepingCapacity: true); expected = 0; pts = nil
-        return (unit, p)
-    }
-}
-
 /// Pulls subpicture units straight out of MPEG-PS sectors (private stream 1, substreams 0x20-0x3F), so
 /// the menu player knows a VOBU's subpictures before its video is due, independent of how far the video
 /// decoder has read. Pack / PES layout per ISO 13818-1 and dvd.sourceforge.net's dvdmpeg notes.
 struct DVDSubpictureScanner: Sendable {
+    private static let noPTS = Int64.min
     private var assemblers: [Int: DVDSubpictureAssembler] = [:]
 
     /// Scans whole 2048-byte sectors; returns completed units with their stream number and PTS (seconds).
@@ -307,10 +284,11 @@ struct DVDSubpictureScanner: Sendable {
                 }
                 let stream = Int(sub & 0x1F)
                 var asm = assemblers[stream] ?? DVDSubpictureAssembler()
-                let ptsTicks = pts.map { Int64(($0 * 90000).rounded()) }
-                if let done = asm.feed(Array(bytes[(subAt + 1) ..< next]), pts: ptsTicks),
-                   let unit = DVDSubpictureUnit.parse(done.unit) {
-                    out.append((stream, unit, done.pts.map { Double($0) / 90000 }))
+                let ptsTicks = pts.map { Int64(($0 * 90000).rounded()) } ?? Self.noPTS
+                let timing = DVDSubpictureAssembler.Timing(pts: ptsTicks, dts: ptsTicks, pos: Int64(s), duration: 0)
+                if let done = bytes[(subAt + 1) ..< next].withUnsafeBytes({ asm.ingest($0, timing: timing) }),
+                   let unit = DVDSubpictureUnit.parse(done.data) {
+                    out.append((stream, unit, done.timing.pts == Self.noPTS ? nil : Double(done.timing.pts) / 90000))
                 }
                 assemblers[stream] = asm
             }

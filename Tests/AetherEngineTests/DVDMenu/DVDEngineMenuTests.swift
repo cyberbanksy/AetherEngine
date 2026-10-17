@@ -104,7 +104,10 @@ struct DVDEngineMenuTests {
         let replacement = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
         engine.bind(view: replacement)
         #expect(controller.displayLayer.superlayer != nil)
+        // Unbinding the presenting view falls back to the one still bound.
         engine.unbind(view: replacement)
+        #expect(controller.displayLayer.superlayer != nil)
+        engine.unbind(view: view)
         #expect(controller.displayLayer.superlayer == nil)
         // Queue callbacks while this actor still owns the session, then tear it down before
         // the main queue delivers them. They must not revive menu state or frame readiness.

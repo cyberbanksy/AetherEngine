@@ -114,14 +114,6 @@ struct DVDSubpictureTests {
         #expect(black.r == 0 && black.g == 0 && black.b == 0)
     }
 
-    @Test func assemblerJoinsFragments() {
-        var a = DVDSubpictureAssembler()
-        #expect(a.feed([0x00, 0x08, 0x00, 0x04], pts: 90000) == nil)
-        let done = a.feed([0xAA, 0xBB, 0xCC, 0xDD], pts: nil)
-        #expect(done?.unit == [0x00, 0x08, 0x00, 0x04, 0xAA, 0xBB, 0xCC, 0xDD])
-        #expect(done?.pts == 90000)
-    }
-
     @Test func scannerFindsSubpicturePacketsInSectors() throws {
         let payload = unit(x: 0, y: 0, top: [[(0, 1)]], bottom: [[(0, 1)]], width: 16)
         // One pack: MPEG-2 pack header (14 bytes), then a private-stream-1 PES with PTS 2 s, substream 0x21.

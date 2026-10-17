@@ -545,7 +545,7 @@ final class DVDMenuPlayer {
             overlay = image
             overlayGeneration += 1
             compositor.update(cues: image.map { [SubtitleCue(id: overlayGeneration, startTime: -.infinity, endTime: .infinity, body: .image($0))] } ?? [],
-                              enabled: image != nil)
+                              enabled: image != nil, delaySeconds: 0)   // menu highlights ignore the subtitle delay
         }
         if emit, let last = lastFrame, let raw = lastRawFrame {
             self.emit(raw, sourcePTS: last.sourcePTS, domain: last.domain)
