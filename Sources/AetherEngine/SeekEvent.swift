@@ -112,15 +112,19 @@ extension AetherEngine {
     /// `frozen` is the rendered position when the watch was armed, which is the pre-scrub picture: AVPlayer
     /// has committed to the new time and cannot render the old region forward while the seek is pending.
     /// It supplies the direction and, on a backward scrub, the evidence that the picture actually jumped
-    /// off the old playhead rather than the old buffer draining under a still-pending seek.
+    /// off the old playhead rather than the old buffer draining under a still-pending seek. nil when no
+    /// picture was up as the restart began (a resume asking for the segment below its start): there is
+    /// no old playhead to leave, so reaching the restarted region is the landing in either direction.
     nonisolated static func nativeScrubLanded(
         rendered: Double,
         target: Double,
-        frozen: Double,
+        frozen: Double?,
         tolerance: Double = 0.75
     ) -> Bool {
-        guard rendered.isFinite, target.isFinite, frozen.isFinite else { return false }
+        guard rendered.isFinite, target.isFinite else { return false }
         guard rendered >= target - tolerance else { return false }
+        guard let frozen else { return true }
+        guard frozen.isFinite else { return false }
         // Forward: reaching the restarted region is the landing (overshoot included, a playing item keeps
         // moving while the 100 ms tick that observes it settles).
         if target >= frozen { return true }

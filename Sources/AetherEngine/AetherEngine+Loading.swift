@@ -120,8 +120,10 @@ extension AetherEngine {
             .filter { $0 }
             .prefix(1)
             .sink { [weak self] _ in
-                self?.hasFirstFrameReadyForDisplay = true
-                self?.recordStartupCheckpoint(.presenting)   // #361: the picture is up
+                guard let self else { return }
+                self.hasFirstFrameReadyForDisplay = true
+                self.recordStartupCheckpoint(.presenting)   // #361: the picture is up
+                if let host = self.nativeHost { self.checkPendingScrubLanding(rendered: host.renderedTime) }
             }
             .store(in: &cancellables)
     }

@@ -285,6 +285,11 @@ public final class AetherEngine: ObservableObject {
     /// the rising edge, because by the drain the programmatic seek may already have finalized.
     var scrubRestartOwnedByProgrammaticSeek = false
 
+    /// Did the in-flight restart run begin before this load's first picture? Then the rendered position at
+    /// the drain is the requested start, not a picture the landing has to leave (resume: the player asks
+    /// for the segment below the one the engine started at).
+    var scrubRestartBeganBeforeFirstFrame = false
+
     private func nextSeekEventID() -> UInt64 {
         seekEventCounter &+= 1
         return seekEventCounter
@@ -418,6 +423,8 @@ public final class AetherEngine: ObservableObject {
             // would report a miss on a seek that landed fine, so this restart keeps the old drain-edge
             // semantics and the programmatic ticket carries the outcome.
             scrubRestartOwnedByProgrammaticSeek = programmaticSeekInFlight
+            scrubRestartBeganBeforeFirstFrame = (nativeScrubSeekInFlight ? scrubRestartBeganBeforeFirstFrame : true)
+                && !hasFirstFrameReadyForDisplay
             guard let target else {
                 // No resolvable segment time (index outside the plan): keep the flag honest but publish no
                 // target, and leave the landing watch unarmed.
@@ -465,7 +472,7 @@ public final class AetherEngine: ObservableObject {
                 ? watchTarget - liveSessionShiftSeconds - liveItemAxisOffsetSeconds
                 : PresentationAxis.source(displayTime: watchTarget,
                                           origin: sourcePresentationOrigin) - playlistShiftSeconds,
-            frozenRendered: host.renderedTime
+            frozenRendered: scrubRestartBeganBeforeFirstFrame ? nil : host.renderedTime
         )
         // The watch runs on `$renderedTime`, which goes silent while AVPlayer waits to play, so the
         // give-up cannot be tick-driven.
@@ -498,6 +505,8 @@ public final class AetherEngine: ObservableObject {
     /// `$renderedTime` hook for the scrub landing watch. No-op unless a watch is armed.
     func checkPendingScrubLanding(rendered: Double) {
         guard let watch = pendingScrubLanding else { return }
+        // Without a picture to leave, the landing is the first picture in the restarted region.
+        guard watch.frozenRendered != nil || hasFirstFrameReadyForDisplay else { return }
         guard Self.nativeScrubLanded(rendered: rendered,
                                      target: watch.playlistTarget,
                                      frozen: watch.frozenRendered) else { return }
@@ -514,7 +523,8 @@ public final class AetherEngine: ObservableObject {
     struct PendingScrubLanding {
         let displayTarget: Double
         let playlistTarget: Double
-        let frozenRendered: Double
+        /// nil when the restart began before the load's first picture.
+        let frozenRendered: Double?
     }
 
     /// Budget for the scrub landing watch. Same order as the programmatic seek's reconcile budget: past

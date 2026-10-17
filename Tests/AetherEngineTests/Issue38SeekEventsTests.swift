@@ -161,6 +161,50 @@ struct Issue38SeekEventsTests {
         #expect(!AetherEngine.nativeScrubLanded(rendered: 50, target: 100, frozen: 900))
     }
 
+    @Test("a restart that began before the first picture lands on reaching its region, either way")
+    func scrubLandingWithoutPicture() {
+        // Resume at 600: the player asks for the segment at 594 and plays on from the start position.
+        #expect(AetherEngine.nativeScrubLanded(rendered: 600, target: 594, frozen: nil))
+        #expect(AetherEngine.nativeScrubLanded(rendered: 594, target: 594, frozen: nil))
+        #expect(!AetherEngine.nativeScrubLanded(rendered: 500, target: 594, frozen: nil))
+        #expect(!AetherEngine.nativeScrubLanded(rendered: .nan, target: 594, frozen: nil))
+    }
+
+    @MainActor
+    @Test("a resume's restart below its start closes at the first picture, not at the watchdog")
+    func resumeRestartClosesAtFirstPicture() async throws {
+        let engine = try AetherEngine()
+        var events: [SeekEvent] = []
+        let sub = engine.seekEvents.sink { events.append($0) }
+        defer { sub.cancel() }
+
+        engine.setNativeScrubSeek(inFlight: true, target: 594)
+        #expect(engine.scrubRestartBeganBeforeFirstFrame)
+        engine.nativeScrubSeekTicket = AetherEngine.SeekTicket(id: 9, target: 594, origin: .nativeScrub)
+        engine.pendingScrubLanding = AetherEngine.PendingScrubLanding(
+            displayTarget: 594, playlistTarget: 594, frozenRendered: nil)
+
+        engine.checkPendingScrubLanding(rendered: 600)     // AVPlayer at the start position, no picture yet
+        #expect(events.allSatisfy { $0.id != 9 })
+        #expect(engine.isSeeking)
+
+        engine.hasFirstFrameReadyForDisplay = true
+        engine.checkPendingScrubLanding(rendered: 600.1)
+        #expect(events.last?.id == 9)
+        if case .landed = events.last?.outcome {} else { Issue.record("expected a landing, got \(String(describing: events.last))") }
+        #expect(engine.isSeeking == false)
+    }
+
+    @MainActor
+    @Test("a restart after the first picture keeps the frozen-playhead rule")
+    func restartAfterPictureKeepsFrozenRule() async throws {
+        let engine = try AetherEngine()
+        engine.hasFirstFrameReadyForDisplay = true
+        engine.setNativeScrubSeek(inFlight: true, target: 100)
+        #expect(engine.scrubRestartBeganBeforeFirstFrame == false)
+        engine.setNativeScrubSeek(inFlight: false, target: nil)
+    }
+
     @Test("a non-finite rendered position is never a landing")
     func scrubLandingRejectsGarbage() {
         #expect(!AetherEngine.nativeScrubLanded(rendered: .nan, target: 100, frozen: 20))
