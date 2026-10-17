@@ -5,8 +5,8 @@ import XCTest
 /// recognition (UDF/ISO directory parse + every .mpls/.IFO read). `DiscReader.wrap` must memoize the
 /// parsed structure per source key so a second open reuses it instead of re-reading the disc.
 final class DiscRecognitionCacheTests: XCTestCase {
-    override func setUp() { super.setUp(); DiscReader.clearCache() }
-    override func tearDown() { DiscReader.clearCache(); super.tearDown() }
+    override func setUp() { super.setUp(); DiscRecognitionCache.clear(includingContent: true) }
+    override func tearDown() { DiscRecognitionCache.clear(includingContent: true); super.tearDown() }
 
     /// Counts every `read` so a cache hit (which must not touch the fresh reader's bytes during
     /// recognition) is observable. Payload reads through the rebuilt concat reader come after the
@@ -64,9 +64,41 @@ final class DiscRecognitionCacheTests: XCTestCase {
         let image = bdImage()
         _ = try XCTUnwrap(try DiscReader.wrap(CountingIOReader(image), cacheKey: "disc://a.iso"))
 
-        let r2 = CountingIOReader(image)
+        let r2 = CountingIOReader(image + Data(count: 2048))
         _ = try XCTUnwrap(try DiscReader.wrap(r2, cacheKey: "disc://b.iso"))
         XCTAssertGreaterThan(r2.readCount, 0, "a different source key must re-parse, not bleed across discs")
+    }
+
+    /// A host that serves each play from a fresh URL (a loopback bridge with a per-play token) and the
+    /// engine's per-load `clearCache()` used to force a full re-parse of the same disc every time.
+    func test_sameImageAtNewURLAfterNewLoadSkipsTheParse() throws {
+        let image = bdImage()
+        let r1 = CountingIOReader(image)
+        _ = try XCTUnwrap(try DiscReader.wrap(r1, cacheKey: "http://127.0.0.1:1/media/aaaa/movie.iso"))
+        DiscReader.clearCache()
+
+        let r2 = CountingIOReader(image)
+        let info = try XCTUnwrap(try DiscReader.wrap(r2, cacheKey: "http://127.0.0.1:1/media/bbbb/movie.iso"))
+        XCTAssertEqual(info.titles.count, 1)
+        XCTAssertLessThan(r2.readCount, r1.readCount, "a content hit reads the descriptors only")
+        XCTAssertLessThanOrEqual(r2.readCount, 5)
+
+        // The session key is bound now, so the next open in the same session reads nothing.
+        let r3 = CountingIOReader(image)
+        _ = try XCTUnwrap(try DiscReader.wrap(r3, selectTitleID: 0, cacheKey: "http://127.0.0.1:1/media/bbbb/movie.iso"))
+        XCTAssertEqual(r3.readCount, 0)
+    }
+
+    func test_contentIdentityTracksNameSizeAndDescriptors() throws {
+        let image = bdImage()
+        let a = try XCTUnwrap(DiscReader.contentIdentity(DataIOReader(data: image), name: "movie.iso"))
+        XCTAssertEqual(a, DiscReader.contentIdentity(DataIOReader(data: image), name: "movie.iso"))
+        XCTAssertNotEqual(a, DiscReader.contentIdentity(DataIOReader(data: image), name: "other.iso"))
+        XCTAssertNotEqual(a, DiscReader.contentIdentity(DataIOReader(data: image + Data(count: 2048)), name: "movie.iso"))
+        var relabelled = image
+        relabelled[16 * 2048 + 40] ^= 0xFF
+        XCTAssertNotEqual(a, DiscReader.contentIdentity(DataIOReader(data: relabelled), name: "movie.iso"))
+        XCTAssertNil(DiscReader.contentIdentity(DataIOReader(data: Data(count: 4096)), name: "tiny.iso"))
     }
 
     func test_nilKeyNeverCaches() throws {

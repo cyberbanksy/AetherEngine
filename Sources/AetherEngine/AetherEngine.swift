@@ -4211,10 +4211,11 @@ public final class AetherEngine: ObservableObject {
         // The public #315 counterpart is un-latched by the stopInternal() above, which every load()
         // runs. The seams that reuse the running host call host.load() directly, reach neither, and
         // keep the latch through their few tens of ms without a picture.
-        // Drop disc recognition memoized for the previous media. Track-switch reopens (audio / subtitle
-        // side demuxer) deliberately keep it so a remote ISO is parsed once per session (#76); only a
-        // genuinely new load clears it, which also keeps custom sources (shared placeholder URL) from
-        // bleeding one disc's structure into the next.
+        // Drop disc recognition memoized per URL for the previous media. Track-switch reopens (audio /
+        // subtitle side demuxer) deliberately keep it so a remote ISO is parsed once per session (#76);
+        // only a genuinely new load clears it, which also keeps custom sources (shared placeholder URL)
+        // from bleeding one disc's structure into the next. Recognitions keyed by the image's content
+        // survive, so loading the same disc again skips the parse.
         DiscReader.clearCache()
         // Capture generation; every suspension point re-checks for supersession.
         let gen = loadGeneration

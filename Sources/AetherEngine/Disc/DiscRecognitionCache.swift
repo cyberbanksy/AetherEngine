@@ -42,10 +42,18 @@ struct DiscRecognition: Sendable {
 /// different threads. Entries are KB-scale (offset/length pairs + title metadata); a small LRU bounds
 /// memory without needing explicit per-session eviction, though `AetherEngine` also clears it when a
 /// new URL loads.
+///
+/// A second table, keyed by the image's content identity (`DiscReader.contentIdentity`), survives those
+/// clears, so loading the same disc again (a host's per-play loopback URL, the next part, a re-open
+/// after backing out) skips the parse too: 12–14 s for a Blu-ray over an iPhone's share. A session key
+/// is bound to its identity on the first open, and every store under it lands in both tables.
 enum DiscRecognitionCache {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var entries: [String: DiscRecognition] = [:]
     nonisolated(unsafe) private static var order: [String] = []   // LRU recency, most-recent last
+    nonisolated(unsafe) private static var contentEntries: [String: DiscRecognition] = [:]
+    nonisolated(unsafe) private static var contentOrder: [String] = []
+    nonisolated(unsafe) private static var contentIdentityBySessionKey: [String: String] = [:]
     private static let capacity = 6
 
     private static func compositeKey(_ key: String, selectTitleID: Int?) -> String {
@@ -53,29 +61,62 @@ enum DiscRecognitionCache {
     }
 
     static func lookup(key: String, selectTitleID: Int?) -> DiscRecognition? {
-        let ck = compositeKey(key, selectTitleID: selectTitleID)
         lock.lock(); defer { lock.unlock() }
-        guard let hit = entries[ck] else { return nil }
+        return touch(compositeKey(key, selectTitleID: selectTitleID), in: entries, order: &order)
+    }
+
+    /// Cross-load hit for an image whose session key missed.
+    static func lookup(contentIdentity: String, selectTitleID: Int?) -> DiscRecognition? {
+        lock.lock(); defer { lock.unlock() }
+        return touch(compositeKey(contentIdentity, selectTitleID: selectTitleID),
+                     in: contentEntries, order: &contentOrder)
+    }
+
+    /// Ties a session key to the content identity of the image behind it, so stores under the key also
+    /// reach the cross-load table.
+    static func bind(key: String, contentIdentity: String) {
+        lock.lock(); defer { lock.unlock() }
+        contentIdentityBySessionKey[key] = contentIdentity
+    }
+
+    static func store(key: String, selectTitleID: Int?, _ recognition: DiscRecognition) {
+        lock.lock(); defer { lock.unlock() }
+        insert(compositeKey(key, selectTitleID: selectTitleID), recognition, into: &entries, order: &order)
+        if let identity = contentIdentityBySessionKey[key] {
+            insert(compositeKey(identity, selectTitleID: selectTitleID), recognition,
+                   into: &contentEntries, order: &contentOrder)
+        }
+    }
+
+    /// Drops the session table. The cross-load table stays unless `includingContent`: its keys are the
+    /// image's bytes, so a different disc behind a reused URL cannot hit it.
+    static func clear(includingContent: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll()
+        order.removeAll()
+        contentIdentityBySessionKey.removeAll()
+        if includingContent {
+            contentEntries.removeAll()
+            contentOrder.removeAll()
+        }
+    }
+
+    private static func touch(_ ck: String, in table: [String: DiscRecognition],
+                              order: inout [String]) -> DiscRecognition? {
+        guard let hit = table[ck] else { return nil }
         if let i = order.firstIndex(of: ck) { order.remove(at: i) }
         order.append(ck)
         return hit
     }
 
-    static func store(key: String, selectTitleID: Int?, _ recognition: DiscRecognition) {
-        let ck = compositeKey(key, selectTitleID: selectTitleID)
-        lock.lock(); defer { lock.unlock() }
-        if entries[ck] == nil, order.count >= capacity, let evict = order.first {
+    private static func insert(_ ck: String, _ recognition: DiscRecognition,
+                               into table: inout [String: DiscRecognition], order: inout [String]) {
+        if table[ck] == nil, order.count >= capacity, let evict = order.first {
             order.removeFirst()
-            entries[evict] = nil
+            table[evict] = nil
         }
-        entries[ck] = recognition
+        table[ck] = recognition
         if let i = order.firstIndex(of: ck) { order.remove(at: i) }
         order.append(ck)
-    }
-
-    static func clear() {
-        lock.lock(); defer { lock.unlock() }
-        entries.removeAll()
-        order.removeAll()
     }
 }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Detects a DVD-Video ISO and adapts it to the engine's normal demux path.
@@ -7,9 +8,47 @@ import Foundation
 /// No decryption: encrypted retail ISOs parse but their streams will not
 /// decode; that surfaces downstream as a normal demux/decode failure.
 enum DiscReader {
-    /// Drop every memoized disc recognition. Called when a new URL loads so a different disc at a
-    /// reused cache key can never bleed (the cross-disc safety net `selectTitle` also relies on).
+    /// Drop the disc recognitions memoized per session key. Called when a new URL loads so a different
+    /// disc at a reused cache key can never bleed (the cross-disc safety net `selectTitle` also relies
+    /// on). Recognitions keyed by image content (`contentIdentity`) stay.
     static func clearCache() { DiscRecognitionCache.clear() }
+
+    /// Identity of a disc image's bytes for the cross-load recognition cache: the file name, total size
+    /// and a digest of the volume descriptors (the ISO9660 sector 16, the UDF anchor at 256 and the first
+    /// sector of the volume descriptor sequence it points to). Those carry the volume ids and recording
+    /// times, so two discs of the same size and name still differ, and the identity does not depend on
+    /// a host's per-play URL. nil when the size or the descriptors cannot be read.
+    static func contentIdentity(_ reader: IOReader, name: String) -> String? {
+        let sector: Int64 = 2048
+        let size = reader.seek(offset: 0, whence: 65536)   // AVSEEK_SIZE
+        guard size > 257 * sector else { return nil }
+        func sectorBytes(_ index: Int64) -> [UInt8]? {
+            guard reader.seek(offset: index * sector, whence: SEEK_SET) >= 0 else { return nil }
+            var buf = [UInt8](repeating: 0, count: Int(sector))
+            var got = 0
+            buf.withUnsafeMutableBufferPointer { p in
+                while got < p.count {
+                    let n = reader.read(p.baseAddress!.advanced(by: got), size: Int32(p.count - got))
+                    if n <= 0 { break }
+                    got += Int(n)
+                }
+            }
+            return got == buf.count ? buf : nil
+        }
+        guard let primary = sectorBytes(16), let anchor = sectorBytes(256) else { return nil }
+        var hash = SHA256()
+        hash.update(data: primary)
+        hash.update(data: anchor)
+        // AVDP (tag 2): main volume descriptor sequence extent, location at bytes 20..<24 (little endian).
+        if Int(anchor[0]) | (Int(anchor[1]) << 8) == 2 {
+            let location = anchor[20..<24].reversed().reduce(Int64(0)) { $0 << 8 | Int64($1) }
+            if location > 0, (location + 1) * sector <= size, let sequence = sectorBytes(location) {
+                hash.update(data: sequence)
+            }
+        }
+        let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        return "\(name)|\(size)|\(digest)"
+    }
 
     /// Cheap content sniff: the ISO9660 "CD001" signature at byte 0x8001.
     static func looksLikeISO9660(_ reader: IOReader) -> Bool {
@@ -248,6 +287,14 @@ enum DiscReader {
         }
     }
 
+    private static func discInfo(_ reader: IOReader, _ cached: DiscRecognition) -> DiscInfo {
+        DiscInfo(reader: ConcatIOReader(base: reader, extents: cached.extents),
+                 formatHint: cached.formatHint, titles: cached.titles,
+                 selectedTitleIndex: cached.selectedTitleIndex,
+                 clipTimeline: cached.clipTimeline, seekTable: cached.seekTable,
+                 dvdTimeMap: cached.dvdTimeMap)
+    }
+
     /// Read all bytes of an extent list into memory (small files only: mpls).
     static func readAll(_ base: IOReader, _ exts: [(offset: Int64, length: Int64)]) -> [UInt8] {
         // Extent lengths are untrusted on-disc bytes (up to ~1 GB each). Cap the total before
@@ -284,15 +331,23 @@ enum DiscReader {
             return wrapDVDFolder(folder, selectTitleID: selectTitleID)
         }
         if let cacheKey, let cached = DiscRecognitionCache.lookup(key: cacheKey, selectTitleID: selectTitleID) {
-            return DiscInfo(reader: ConcatIOReader(base: reader, extents: cached.extents),
-                            formatHint: cached.formatHint, titles: cached.titles,
-                            selectedTitleIndex: cached.selectedTitleIndex,
-                            clipTimeline: cached.clipTimeline, seekTable: cached.seekTable,
-                            dvdTimeMap: cached.dvdTimeMap)
+            return discInfo(reader, cached)
         }
-        guard looksLikeISO9660(reader) else {
-            // The anchor is read once: a probe's input budget counts every read recognition makes.
-            guard looksLikeUDF(reader) else { return nil }
+        // The anchor is read once: a probe's input budget counts every read recognition makes.
+        let isISO9660 = looksLikeISO9660(reader)
+        guard isISO9660 || looksLikeUDF(reader) else { return nil }
+        if let cacheKey,
+           let identity = contentIdentity(reader, name: URL(string: cacheKey)?.lastPathComponent ?? cacheKey) {
+            DiscRecognitionCache.bind(key: cacheKey, contentIdentity: identity)
+            if let cached = DiscRecognitionCache.lookup(contentIdentity: identity, selectTitleID: selectTitleID) {
+                DiscRecognitionCache.store(key: cacheKey, selectTitleID: selectTitleID, cached)
+                if selectTitleID != cached.selectedTitleIndex {
+                    DiscRecognitionCache.store(key: cacheKey, selectTitleID: cached.selectedTitleIndex, cached)
+                }
+                return discInfo(reader, cached)
+            }
+        }
+        guard isISO9660 else {
             if let bluRay = try wrapBluRay(reader, selectTitleID: selectTitleID, cacheKey: cacheKey,
                                            udfAnchorChecked: true) {
                 return bluRay
