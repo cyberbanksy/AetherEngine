@@ -129,9 +129,22 @@ struct DVDEngineMenuTests {
         _ = try await engine.load(url: iso, options: LoadOptions(suppressDisplayCriteria: true, dvdStartMode: .menu))
         #expect(await waitUntil { engine.dvdMenu?.isStill == true })
         engine.dvdActivate()
-        #expect(await waitUntil(15) { engine.dvdMenu?.isPlayingTitle == true && engine.state == .playing && engine.duration > 1 },
+        #expect(await waitUntil(15) { engine.dvdMenu?.isPlayingTitle == true && engine.state == .playing && engine.selectedDiscTitle != nil && !engine.discChapters.isEmpty },
                 "state \(engine.state) duration \(engine.duration) menu \(String(describing: engine.dvdMenu))")
         #expect(engine.dvdMenuController != nil)
+        let title = try #require(engine.selectedDiscTitle)
+        #expect(abs(title.durationSeconds - 2.001) < 0.0001)
+        #expect(abs(engine.duration - title.durationSeconds) < 0.01)
+        let chapters = engine.discChapters
+        try #require(chapters.count == 2)
+        #expect(chapters[0].startSeconds == 0)
+        #expect(abs(chapters[1].startSeconds - 1.2002) < 0.0001)
+        #expect(abs(chapters[1].durationSeconds - 0.8008) < 0.0001)
+        engine.pause()
+        #expect(engine.sourceStartSeconds == 0)
+        engine.selectChapter(id: 1)
+        #expect(await waitUntil { abs(engine.currentTime - chapters[1].startSeconds) < 0.1 })
+        engine.play()
         // Title 1 is 2 s; its post command calls the VMGM menu.
         #expect(await waitUntil(20) { engine.dvdMenu?.isInMenu == true && engine.dvdMenu?.isStill == true },
                 "state \(engine.state) menu \(String(describing: engine.dvdMenu))")
@@ -139,6 +152,32 @@ struct DVDEngineMenuTests {
         #expect(engine.videoRoute == .software)
         #expect(await waitUntil { engine.softwareDisplaySize != nil && engine.playbackPhase == .playing })
         engine.stop()
+    }
+
+    @Test("Chapter entry at cell two keeps the full title clock and resume cell")
+    func chapterEntryKeepsTitleClock() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: iso, options: LoadOptions(suppressDisplayCriteria: true, dvdStartMode: .menu))
+        let controller = try #require(engine.dvdMenuController)
+        #expect(await waitUntil { engine.dvdMenu?.isStill == true })
+        controller.perform { $0.playTitle(2) }
+        #expect(await waitUntil(15) { engine.selectedDiscTitle != nil })
+        #expect(engine.selectedDiscTitle?.id == 0)
+        engine.dvdMenu(.chapter)
+        #expect(await waitUntil { engine.dvdMenu?.isInMenu == true && engine.dvdMenu?.isStill == true })
+        engine.dvdActivate(atNormalizedPoint: CGPoint(x: 150.0 / 720, y: 230.0 / 480))
+        #expect(await waitUntil(15) {
+            engine.dvdMenu?.isPlayingTitle == true && engine.selectedDiscTitle?.chapterCount == 2
+                && engine.currentTime >= 1.1
+        })
+        engine.pause()
+        #expect(abs(engine.currentTime - 1.2002) < 0.4)
+        await engine.seek(to: 0.5)
+        #expect(abs(engine.currentTime - 0.5) < 0.3)
+        engine.dvdMenu(.title)
+        #expect(await waitUntil { engine.dvdMenu?.isInMenu == true && engine.dvdMenu?.isStill == true })
+        #expect(controller.performSync { $0.state.resume?.cell } == 1)
     }
 
     @Test("Menu key from a playing title suspends it; Resume returns to the reached cell")
@@ -216,6 +255,29 @@ struct DVDEngineMenuTests {
         #expect(await waitUntil { engine.dvdMenu?.isPlayingTitle == true })
         #expect(engine.dvdMenuController?.initialTitlePosition == 1.5)
         engine.stop()
+    }
+
+    @Test("Audio reload preserves a menu title and its chapter timeline")
+    func audioReloadPreservesMenuTitle() async throws {
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        _ = try await engine.load(url: DVDMenuPlayerTests.fixture("menu-features.iso"),
+                                  options: LoadOptions(suppressDisplayCriteria: true, dvdStartMode: .mainTitle))
+        try #require(await waitUntil(15) { engine.selectedDiscTitle != nil && engine.state == .playing })
+        engine.pause()
+        let title = try #require(engine.selectedDiscTitle)
+        let chapters = engine.discChapters
+        try #require(chapters.isEmpty == false)
+        let audio = try #require(engine.audioTracks.first { $0.id != engine.activeAudioTrackIndex })
+        let generation = engine.loadGeneration
+        engine.selectAudioTrack(index: audio.id)
+        try #require(await waitUntil(15) {
+            engine.loadGeneration > generation && engine.activeAudioTrackIndex == audio.id && engine.state != .loading
+        }, "state \(engine.state), generation \(generation) -> \(engine.loadGeneration), audio \(String(describing: engine.activeAudioTrackIndex)) expected \(audio.id), seekable \(engine.customSourceIsSeekable)")
+        #expect(engine.selectedDiscTitle == title)
+        #expect(engine.discChapters == chapters)
+        #expect(engine.sourceStartSeconds == 0)
+        #expect(engine.dvdMenuController != nil)
     }
 
     @Test("Title stream selection: audio substream n maps to its container stream")

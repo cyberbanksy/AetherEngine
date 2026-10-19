@@ -159,7 +159,7 @@ final class DVDMenuController {
         Task { @MainActor in
             // Forking an HTTP disc reader performs a range probe. Keep it off the UI actor.
             let reader = await Task.detached(priority: .userInitiated) {
-                disc.makeReader(.title(vts: req.vts), sectorRanges: req.sectorRanges)
+                disc.makeTitleReader(req)
             }.value
             guard let engine = self.engine, engine.dvdMenuController === self,
                   self.titleActive, engine.loadGeneration == generation else {
@@ -226,11 +226,37 @@ final class EngineDVDTitleHost: DVDTitleHost {
         guard let engine = controller.engine else { return }
         var options = engine.loadedOptions
         options.dvdStartMode = .mainTitle
+        let navigation = controller.player.disc.navigation
+        guard let titleSet = navigation.titleSets[request.vts],
+              titleSet.titlePGCs.indices.contains(request.pgcn - 1) else {
+            engine.dvdMenuSessionEnded(error: "title navigation metadata missing")
+            return
+        }
+        let pgc = titleSet.titlePGCs[request.pgcn - 1].pgc
+        let titleDuration = request.durationSeconds
+        guard let titleID = controller.player.disc.titleOrdinal(vts: request.vts),
+              let entrySeconds = request.startSeconds else {
+            engine.dvdMenuSessionEnded(error: "title cell metadata missing")
+            return
+        }
+        let parts = titleSet.ptts.indices.contains(request.vtsTitle - 1) ? titleSet.ptts[request.vtsTitle - 1] : []
+        let chapterStarts = parts.enumerated().compactMap { index, part -> (Int, Double)? in
+            guard part.pgcn == request.pgcn, pgc.programMap.indices.contains(part.pgn - 1) else { return nil }
+            let cell = pgc.programMap[part.pgn - 1] - 1
+            guard request.cellStartSeconds.indices.contains(cell) else { return nil }
+            return (index, request.cellStartSeconds[cell])
+        }
+        let chapters = chapterStarts.enumerated().map { index, chapter in
+            let end = index + 1 < chapterStarts.count ? chapterStarts[index + 1].1 : titleDuration
+            return ChapterInfo(id: chapter.0, name: "Chapter \(chapter.0 + 1)",
+                               startSeconds: chapter.1, durationSeconds: max(0, end - chapter.1))
+        }
+        options.declaredDurationSeconds = titleDuration > 0 ? titleDuration : nil
         let audioIndex = request.audioStreamNumber.flatMap { Self.streamIndex(in: reader, audio: $0) }
         engine.dvdTitleHandoffInProgress = true
         defer { engine.dvdTitleHandoffInProgress = false }
         do {
-            let startPosition = controller.initialTitlePosition
+            let startPosition = controller.initialTitlePosition ?? entrySeconds
             controller.initialTitlePosition = nil
             _ = try await engine.load(source: .custom(reader, formatHint: "mpeg"), startPosition: startPosition, options: options,
                                       audioSourceStreamIndex: audioIndex.map(Int32.init))
@@ -238,6 +264,10 @@ final class EngineDVDTitleHost: DVDTitleHost {
             engine.dvdMenuSessionEnded(error: "title load failed: \(error)")
             return
         }
+        guard engine.dvdMenuController === controller, controller.titleActive else { return }
+        engine.selectedDiscTitle = TitleInfo(id: titleID, name: "Title \(titleID + 1)",
+                                            durationSeconds: titleDuration, chapterCount: chapters.count)
+        engine.discChapters = chapters
         if let sp = request.subpictureStreamNumber,
            let track = engine.subtitleTracks.first(where: { Self.isSubpicture(stream: $0.id, number: sp, in: engine) }) {
             engine.selectSubtitleTrack(index: track.id)

@@ -67,15 +67,23 @@ struct DVDTitleRequest: Equatable {
     let vtsTitle: Int
     let pgcn: Int
     let startCell: Int
-    /// Sector ranges of the title VOB set to play, start cell (and resume offset) onward.
+    /// Sector ranges of the complete title PGC, keeping seeks on the full title timeline.
     let sectorRanges: [Range<UInt32>]
-    /// Start time of each cell from `startCell` on, relative to the start of the request (seconds).
+    /// Start time of each cell relative to the beginning of the title PGC (seconds).
     let cellStartSeconds: [Double]
+    let selectedCells: [Int]
+    let durationSeconds: Double
+    let angle: Int
     /// MPEG-PS stream ids selected by SPRM 1 / SPRM 2 through the PGC stream control: audio substream
     /// (0x80+n AC-3, 0xA0+n LPCM, 0x88+n DTS, or 0xC0+n MPEG) and subpicture stream (0x20+n), nil = default / off.
     let audioStreamNumber: Int?
     let subpictureStreamNumber: Int?
     let isResume: Bool
+
+    var startSeconds: Double? {
+        guard cellStartSeconds.indices.contains(startCell - 1) else { return nil }
+        return cellStartSeconds[startCell - 1]
+    }
 }
 
 final class DVDMenuPlayer {
@@ -279,8 +287,8 @@ final class DVDMenuPlayer {
     /// on the cell's start.
     func titlePosition(seconds: Double) {
         guard let req = externalTitle else { return }
-        var cell = req.startCell
-        for (i, start) in req.cellStartSeconds.enumerated() where start <= seconds { cell = req.startCell + i }
+        var cell = req.selectedCells.first.map { $0 + 1 } ?? req.startCell
+        for index in req.selectedCells where req.cellStartSeconds[index] <= seconds { cell = index + 1 }
         // Re-point the VM at the cell the host reached so a CallSS / menu key saves the right resume cell.
         if cell != state.cell, let pgc = vm.currentPGC(state), pgc.cells.indices.contains(cell - 1) {
             state.cell = cell
@@ -325,16 +333,16 @@ final class DVDMenuPlayer {
         target = t
         guard let pgc = vm.currentPGC(state) else { onFault?("title PGC missing"); return }
         self.pgc = pgc
-        let ranges = DVDDiscSource.cellRanges(of: pgc, fromCell: t.cellNumber, angle: Int(state.sprm[3]),
-                                             startSectorOffset: t.startSectorOffset)
-        var starts: [Double] = []
-        var acc = 0.0
-        for c in pgc.cells.dropFirst(t.cellNumber - 1) { starts.append(acc); acc += c.playbackTime.totalSeconds }
+        let angle = Int(state.sprm[3])
+        let ranges = DVDDiscSource.cellRanges(of: pgc, angle: angle)
+        let timeline = DVDDiscSource.cellTimeline(of: pgc, angle: angle)
+        guard let startCell = timeline.cells.first(where: { $0 >= t.cellNumber - 1 }) else { onFault?("title cell missing"); return }
         let audioTrack = Int(state.sprm[1])
         let sp = state.sprm[2]
         let req = DVDTitleRequest(
             vts: state.vtsn, title: Int(state.sprm[4]), vtsTitle: Int(state.sprm[5]), pgcn: t.pgcn,
-            startCell: t.cellNumber, sectorRanges: ranges, cellStartSeconds: starts,
+            startCell: startCell + 1, sectorRanges: ranges, cellStartSeconds: timeline.starts,
+            selectedCells: timeline.cells, durationSeconds: timeline.duration, angle: angle,
             audioStreamNumber: audioTrack == 15 ? nil : pgc.audioStream(track: audioTrack),
             subpictureStreamNumber: sp & 0x40 != 0 ? pgc.subpictureStream(track: Int(sp & 0x1F), mode: displayMode == .normal ? 0 : displayMode.rawValue + 1) : nil,
             isResume: t.startSectorOffset > 0)

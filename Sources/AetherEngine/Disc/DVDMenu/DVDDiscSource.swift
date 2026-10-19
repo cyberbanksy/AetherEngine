@@ -146,16 +146,78 @@ final class DVDDiscSource: @unchecked Sendable {
         return ConcatIOReader(base: base, extents: exts)
     }
 
+    func titleOrdinal(vts: Int) -> Int? {
+        let validSets = Set(navigation.vmgi.titles.map(\.vtsn))
+        return DVDTitleSelector.orderedTitleVOBGroups(files, titleSets: validSets).firstIndex { $0.vtsn == vts }
+    }
+
+    static func cellTimeline(of pgc: DVDPGC, angle: Int) -> (cells: [Int], starts: [Double], duration: Double) {
+        var selected: [Int] = []
+        var starts: [Double] = []
+        var duration = 0.0
+        var blockIndex = 0
+        for (i, cell) in pgc.cells.enumerated() {
+            starts.append(duration)
+            if cell.isAngleBlock {
+                blockIndex = cell.cellType == 1 ? 1 : blockIndex + 1
+                if blockIndex != max(1, angle) { continue }
+            }
+            selected.append(i)
+            duration += cell.playbackTime.totalSeconds
+        }
+        return (selected, starts, duration)
+    }
+
+    func makeTitleReader(_ request: DVDTitleRequest) -> IOReader? {
+        guard let titleSet = navigation.titleSets[request.vts],
+              titleSet.titlePGCs.indices.contains(request.pgcn - 1) else { return nil }
+        let pgc = titleSet.titlePGCs[request.pgcn - 1].pgc
+        let timeline = Self.cellTimeline(of: pgc, angle: request.angle)
+        var cells: [DVDTitleIOReader.Cell] = []
+        var byteStart: Int64 = 0
+        let set = DVDVOBSet.title(vts: request.vts)
+        for index in timeline.cells {
+            let cell = pgc.cells[index]
+            guard cell.lastVOBUEnd >= cell.firstVOBUStart else { return nil }
+            let byteLength = Int64(cell.lastVOBUEnd - cell.firstVOBUStart + 1) * 2048
+            cells.append(.init(byteStart: byteStart, byteLength: byteLength,
+                               startSeconds: timeline.starts[index], durationSeconds: cell.playbackTime.totalSeconds,
+                               sourceStartSeconds: nil))
+            byteStart += byteLength
+        }
+        guard !cells.isEmpty, let base = makeReader(set, sectorRanges: request.sectorRanges) else { return nil }
+        let timeMap: [DVDTitleIOReader.SeekPoint]?
+        if titleSet.titleTimeMaps.indices.contains(request.pgcn - 1) {
+            let map = titleSet.titleTimeMaps[request.pgcn - 1]
+            timeMap = map.entries.enumerated().compactMap { entry, rawSector in
+                let sector = rawSector & 0x7FFF_FFFF
+                // Angle-one map entries outside the selected angle leave that cell on proportional seeks.
+                guard let selected = timeline.cells.firstIndex(where: {
+                    let cell = pgc.cells[$0]
+                    return sector >= cell.firstVOBUStart && sector <= cell.lastVOBUEnd
+                }) else { return nil }
+                let cell = pgc.cells[timeline.cells[selected]]
+                return .init(seconds: Double(entry + 1) * Double(map.intervalSeconds),
+                             byteOffset: cells[selected].byteStart + Int64(sector - cell.firstVOBUStart) * 2048)
+            }
+        } else {
+            timeMap = nil
+        }
+        let reader = DVDTitleIOReader(base: base, cells: cells, duration: timeline.duration, timeMap: timeMap) { index in
+            let cell = pgc.cells[timeline.cells[index]]
+            return DVDNavPack.parse(sector: self.readSectors(set, from: cell.firstVOBUStart, count: 1))
+                .map { Double($0.pci.vobuStartPTM) / 90000 }
+        }
+        _ = reader.timestampShift(at: 0)
+        return reader
+    }
+
     /// The sector ranges of a PGC's cells from `fromCell` (1-based) on, skipping the angle-block cells
     /// that `angle` does not select. Used to hand a title PGC to the normal playback pipeline.
     static func cellRanges(of pgc: DVDPGC, fromCell: Int = 1, angle: Int = 1, startSectorOffset: UInt32 = 0) -> [Range<UInt32>] {
         var ranges: [Range<UInt32>] = []
-        var blockIndex = 0
-        for (i, c) in pgc.cells.enumerated() where i + 1 >= fromCell {
-            if c.isAngleBlock {
-                blockIndex = c.cellType == 1 ? 1 : blockIndex + 1
-                if blockIndex != max(1, angle) { continue }
-            }
+        for i in cellTimeline(of: pgc, angle: angle).cells where i + 1 >= fromCell {
+            let c = pgc.cells[i]
             var start = c.firstVOBUStart
             if i + 1 == fromCell { start = start &+ startSectorOffset }
             guard c.lastVOBUEnd >= start else { continue }

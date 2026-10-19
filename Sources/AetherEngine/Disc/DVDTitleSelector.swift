@@ -24,6 +24,12 @@ enum DVDTitleSelector {
             }
     }
 
+    static func orderedTitleVOBGroups(_ files: [DiscFile], titleSets: Set<Int>) -> [(vtsn: Int, vobs: [DiscFile])] {
+        let groups = enumerateTitleVOBGroups(files)
+        let filtered = groups.filter { titleSets.contains($0.vtsn) }
+        return filtered.isEmpty ? groups : filtered
+    }
+
     static func selectMainTitleVOBs(_ files: [DiscFile]) -> [DiscFile] {
         enumerateTitleVOBGroups(files).first?.vobs ?? []
     }

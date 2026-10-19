@@ -3513,7 +3513,11 @@ public final class AetherEngine: ObservableObject {
         // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
         // AV_NOPTS_VALUE (Int64.min) when unknown; only a positive value is a real offset.
         let probedStartTime = probeOpened ? probe.formatStartTime : 0
-        sourceStartSeconds = probedStartTime > 0 ? Double(probedStartTime) / Double(AV_TIME_BASE) : 0
+        if case .custom(let reader, _) = source, reader is DVDTitleIOReader {
+            sourceStartSeconds = 0
+        } else {
+            sourceStartSeconds = probedStartTime > 0 ? Double(probedStartTime) / Double(AV_TIME_BASE) : 0
+        }
         // Assemble SourceProbe now while the demuxer is open; ownership transfers to loadNative/loadSoftware
         // after which streams are gone (AetherEngine#28).
         let sourceProbe: SourceProbe? = probeOpened

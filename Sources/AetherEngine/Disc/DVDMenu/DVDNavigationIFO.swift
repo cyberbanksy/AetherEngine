@@ -424,6 +424,32 @@ struct DVDPTT: Equatable, Sendable {
     let pgn: Int
 }
 
+/// One PGC's VTS_TMAPT: entries at tmu, 2*tmu, ... seconds on the PGC clock.
+struct DVDTimeMap: Equatable, Sendable {
+    let intervalSeconds: Int
+    /// Bit 31 marks a discontinuity; the remaining bits are a VOB-set sector address.
+    let entries: [UInt32]
+
+    static func parseTable(_ b: DVDBytes, at base: Int) -> [DVDTimeMap] {
+        guard let count = b.u16(base), let lastByte = b.u32(base + 4),
+              b.has(base, Int(lastByte) + 1), Int(lastByte) + 1 >= 8 + Int(count) * 4 else { return [] }
+        var maps: [DVDTimeMap] = []
+        for i in 0..<Int(count) {
+            guard let offset = b.u32(base + 8 + i * 4) else { return [] }
+            let start = base + Int(offset)
+            guard Int(offset) >= 8 + Int(count) * 4, start + 4 <= base + Int(lastByte) + 1,
+                  let interval = b.u8(start), interval > 0, let entries = b.u16(start + 2),
+                  start + 4 + Int(entries) * 4 <= base + Int(lastByte) + 1 else {
+                maps.append(DVDTimeMap(intervalSeconds: 0, entries: []))
+                continue
+            }
+            maps.append(DVDTimeMap(intervalSeconds: Int(interval), entries:
+                (0..<Int(entries)).compactMap { b.u32(start + 4 + $0 * 4) }))
+        }
+        return maps
+    }
+}
+
 /// A Video Title Set (VTS_nn_0.IFO).
 struct DVDVTSI: Equatable, Sendable {
     let menuVOBSSector: UInt32
@@ -431,6 +457,7 @@ struct DVDVTSI: Equatable, Sendable {
     /// ptts[vtsTitle - 1][ptt - 1].
     let ptts: [[DVDPTT]]
     let titlePGCs: [DVDPGCEntry]
+    var titleTimeMaps: [DVDTimeMap] = []
     let menus: [DVDMenuLanguageUnit]
     let menuCellAddresses: [DVDCellAddress]
     let menuVOBUAddresses: [UInt32]
@@ -462,6 +489,7 @@ struct DVDVTSI: Equatable, Sendable {
             titleVOBSSector: b.u32(0xC4) ?? 0,
             ptts: ptts,
             titlePGCs: tableOffset(b, field: 0xCC).map { parsePGCTable(b, at: $0) } ?? [],
+            titleTimeMaps: tableOffset(b, field: 0xD4).map { DVDTimeMap.parseTable(b, at: $0) } ?? [],
             menus: tableOffset(b, field: 0xD0).map { parseMenuTable(b, at: $0) } ?? [],
             menuCellAddresses: tableOffset(b, field: 0xD8).map { parseCellAddressTable(b, at: $0) } ?? [],
             menuVOBUAddresses: tableOffset(b, field: 0xDC).map { parseVOBUAddressMap(b, at: $0) } ?? [],

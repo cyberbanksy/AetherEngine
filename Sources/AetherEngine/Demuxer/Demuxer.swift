@@ -267,6 +267,7 @@ public final class Demuxer: @unchecked Sendable {
     /// non-empty, `readPacket` and `indexedKeyframes` fold each clip's timestamps onto one contiguous
     /// timeline so the playhead does not leap at clip boundaries (AE#105). Guarded by `accessLock`.
     private var clipTimeline: [ClipSpan] = []
+    private var dvdTitleReader: DVDTitleIOReader?
     /// Last clip index resolved from a packet byte position; reused when a packet reports pos < 0
     /// (reads are sequential, so the clip only advances). Guarded by `accessLock`.
     private var lastClipIndex: Int = 0
@@ -314,8 +315,8 @@ public final class Demuxer: @unchecked Sendable {
     /// Fold a raw timestamp onto the contiguous presentation timeline given its byte position and time base.
     /// Must be called under `accessLock`.
     private func normalizedTimestamp(_ ts: Int64, pos: Int64, timeBase: AVRational) -> Int64 {
-        guard ts != Int64.min, !clipTimeline.isEmpty else { return ts }
-        let sub = clipSubtractSeconds(forPos: pos)
+        guard ts != Int64.min else { return ts }
+        let sub = dvdTitleReader?.timestampShift(at: pos) ?? clipSubtractSeconds(forPos: pos)
         guard sub != 0, timeBase.num > 0, timeBase.den > 0 else { return ts }
         let subTicks = Int64((sub * Double(timeBase.den) / Double(timeBase.num)).rounded())
         return ts &- subTicks
@@ -424,6 +425,7 @@ public final class Demuxer: @unchecked Sendable {
     /// `discImageProbeEnabled`.
     func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         self.openProfile = profile
+        self.dvdTitleReader = reader as? DVDTitleIOReader
         if reader.discImageProbeEnabled,
            let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
             adoptDiscInfo(discInfo)
@@ -1329,6 +1331,14 @@ public final class Demuxer: @unchecked Sendable {
            generatedPTSStreams.contains(pkt.pointee.stream_index) {
             pkt.pointee.pts = Int64.min
         }
+        if dvdTitleReader != nil, let pkt = packet,
+           pkt.pointee.stream_index >= 0, pkt.pointee.stream_index < Int32(ctx.pointee.nb_streams),
+           let stream = ctx.pointee.streams[Int(pkt.pointee.stream_index)] {
+            let timeBase = stream.pointee.time_base
+            let position = pkt.pointee.pos
+            pkt.pointee.pts = normalizedTimestamp(pkt.pointee.pts, pos: position, timeBase: timeBase)
+            pkt.pointee.dts = normalizedTimestamp(pkt.pointee.dts, pos: position, timeBase: timeBase)
+        }
         if !clipTimeline.isEmpty, let pkt = packet {
             let si = Int(pkt.pointee.stream_index)
             if si >= 0, si < Int(ctx.pointee.nb_streams), let st = ctx.pointee.streams[si] {
@@ -1466,6 +1476,10 @@ public final class Demuxer: @unchecked Sendable {
     private func resetAfterTimeSeek(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         if let pb = ctx.pointee.pb {
             avio_flush(pb)
+            // The title reader repositions outside AVIO, so flush alone leaves packet byte offsets stale.
+            if let reader = dvdTitleReader {
+                pb.pointee.pos = reader.seek(offset: 0, whence: SEEK_CUR)
+            }
             pb.pointee.eof_reached = 0
             pb.pointee.error = 0
         }
@@ -1496,6 +1510,8 @@ public final class Demuxer: @unchecked Sendable {
     /// one (a stream-anchored seek is measured against exactly that stream), else the container's.
     /// Unknown origins resolve to 0, which keeps the mapping identical to the pre-#268 behaviour.
     private func sourcePTSOriginSeconds(streamIndex: Int32) -> Double {
+        // DVD cell packets are already folded onto the IFO's zero-based title clock.
+        if dvdTitleReader != nil { return 0 }
         guard let ctx = formatContext else { return 0 }
         if streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
            let stream = ctx.pointee.streams[Int(streamIndex)] {
@@ -1851,6 +1867,7 @@ public final class Demuxer: @unchecked Sendable {
     func close() {
         avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
+        dvdTitleReader = nil
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }

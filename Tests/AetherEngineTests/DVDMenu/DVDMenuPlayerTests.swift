@@ -176,6 +176,55 @@ struct DVDMenuPlayerTests {
         h.player.resume()
         let req = try #require(h.titleRequests.last)
         #expect(req.startCell == 2 && h.titleRequests.count == 2)
+        #expect(req.sectorRanges == h.titleRequests[0].sectorRanges)
+        #expect(req.cellStartSeconds == h.titleRequests[0].cellStartSeconds)
+        #expect(abs(try #require(req.startSeconds) - 1.2002) < 0.0001)
+        h.player.titlePosition(seconds: 1.5)
+        h.player.menu(.title)
+        #expect(h.player.state.resume?.cell == 2)
+    }
+
+    @Test func externalChapterEntrySelectsAngleTwo() throws {
+        let source = try #require(FileIOReader(url: Self.fixture("menu-features.iso")))
+        defer { source.close() }
+        let iso = try ISO9660Reader(reader: source)
+        let file = try #require(try iso.list(directory: "VIDEO_TS").first { $0.name == "VTS_01_0.IFO" })
+        var bytes = [UInt8](try Data(contentsOf: Self.fixture("menu-features.iso")))
+        let ifo = file.startSector * iso.sectorSize
+        let b = DVDBytes(bytes)
+        let table = ifo + Int(try #require(b.u32(ifo + 0xCC))) * 2048
+        let pgc = table + Int(try #require(b.u32(table + 12)))
+        let cells = pgc + Int(try #require(b.u16(pgc + 0xE8)))
+        bytes[cells + 24] = (bytes[cells + 24] & 0x0F) | 0x50
+        bytes[cells + 48] = (bytes[cells + 48] & 0x0F) | 0xD0
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".iso")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data(bytes).write(to: url)
+        let disc = try DVDDiscSource(url: url)
+        defer { disc.reader.close() }
+        let player = DVDMenuPlayer(disc: disc, titleMode: .external)
+        var requests: [DVDTitleRequest] = []
+        var fault: String?
+        player.onTitleRequest = { requests.append($0) }
+        player.onFault = { fault = $0 }
+        player.state.sprm[3] = 2
+        player.playTitle(1)
+        player.nextChapter()
+        #expect(fault == nil)
+        #expect(requests.count == 2)
+        let request = try #require(requests.last)
+        #expect(request.angle == 2)
+        #expect(request.startCell == 3)
+        #expect(request.selectedCells == [0, 2, 3, 4, 5])
+        #expect(request.startSeconds == request.cellStartSeconds[2])
+        #expect(try #require(request.startSeconds) > 0)
+    }
+
+    @Test func malformedTitleStartCellDoesNotIndexPastThePGC() {
+        let request = DVDTitleRequest(vts: 1, title: 1, vtsTitle: 1, pgcn: 1, startCell: 2,
+            sectorRanges: [0 ..< 16], cellStartSeconds: [0], selectedCells: [0], durationSeconds: 1,
+            angle: 1, audioStreamNumber: nil, subpictureStreamNumber: nil, isResume: false)
+        #expect(request.startSeconds == nil)
     }
 
     // MARK: menu-features.iso

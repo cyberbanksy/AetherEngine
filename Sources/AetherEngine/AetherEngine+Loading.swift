@@ -1897,6 +1897,8 @@ extension AetherEngine {
         // Disc title to reopen with: an explicit override (selectTitle on a custom disc) wins, else the title
         // already playing so an audio switch / background-resume doesn't silently revert to the main title (#67).
         let titleToReopen = discTitleIDOverride ?? activeDiscTitleID
+        let menuTitleToRestore = customReader is DVDTitleIOReader ? selectedDiscTitle : nil
+        let menuChaptersToRestore = customReader is DVDTitleIOReader ? discChapters : []
         // resumeOverride 0 restarts a title switch at the new title's head; nil keeps the current playhead.
         let resumeAt = resumeOverride ?? currentTime
         let embeddedStreamToResume: Int32 = activeEmbeddedSubtitleStreamIndex
@@ -1968,6 +1970,10 @@ extension AetherEngine {
                     // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
                     // discCacheKey reuses the disc recognition cached at load so an audio switch on a
                     // remote ISO does not re-parse the UDF directory / playlists (#76).
+                    // The retained title reader may have reached EOF during the previous probe or playback.
+                    if reader is DVDTitleIOReader, reader.seek(offset: 0, whence: SEEK_SET) < 0 {
+                        throw DemuxerError.openFailed(code: -1)
+                    }
                     try d.open(reader: reader, formatHint: hint, profile: reloadProfile, isLive: isLiveReload, selectTitleID: titleToReopen, discCacheKey: discCacheKey)
                     return d
                 }.value
@@ -2157,6 +2163,10 @@ extension AetherEngine {
                 applyConfirmedAtmos()   // #214 follow-up: a title switch re-applies probe lists
                 subtitleTracks = reopenedSubtitleTracks
             }
+        } else if let menuTitleToRestore {
+            activeDiscTitleID = titleToReopen
+            selectedDiscTitle = menuTitleToRestore
+            discChapters = menuChaptersToRestore
         } else {
             activeDiscTitleID = nil
         }

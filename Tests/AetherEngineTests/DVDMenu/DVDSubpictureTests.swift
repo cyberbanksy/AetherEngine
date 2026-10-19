@@ -1,5 +1,7 @@
 import Foundation
 import Testing
+import os
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// The clean-room SPU decoder (dvd.sourceforge.net spu.html), the highlight renderer, the PS scanner,
@@ -165,6 +167,250 @@ struct DVDSubpictureTests {
         #expect(DVDDiscSource.cellRanges(of: pgc) == [0 ..< 32, 40 ..< 56, 80 ..< 96])
         #expect(DVDDiscSource.cellRanges(of: pgc, angle: 2) == [0 ..< 32, 60 ..< 76, 80 ..< 96])
         #expect(DVDDiscSource.cellRanges(of: pgc, fromCell: 2, startSectorOffset: 4) == [20 ..< 32, 40 ..< 56, 80 ..< 96])
+    }
+
+    @Test func selectedAngleDefinesTitleClock() {
+        let time = DVDTime(hours: 0, minutes: 0, seconds: 10, frames: 0, frameRate: 25)
+        let cells = [
+            DVDCellPlayback(playbackTime: time),
+            DVDCellPlayback(cellType: 1, blockType: 1, playbackTime: time),
+            DVDCellPlayback(cellType: 3, blockType: 1, playbackTime: time),
+            DVDCellPlayback(stcDiscontinuity: true, playbackTime: time)
+        ]
+        let pgc = DVDTestDisc.pgc(cells: cells, programMap: [1, 2, 4])
+        let timeline = DVDDiscSource.cellTimeline(of: pgc, angle: 2)
+        #expect(timeline.cells == [0, 2, 3])
+        #expect(timeline.starts == [0, 10, 10, 20])
+        #expect(timeline.duration == 30)
+    }
+
+    private final class CountingCellReader: IOReader {
+        struct State { var cursor: Int64 = 0; var bytesRead: Int64 = 0 }
+        let state = OSAllocatedUnfairLock(initialState: State())
+        let length: Int64 = 8 * 1024 * 1024 * 1024
+
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
+            let count = state.withLock {
+                let count = Int32(min(Int64(size), length - $0.cursor))
+                $0.cursor += Int64(count)
+                $0.bytesRead += Int64(count)
+                return count
+            }
+            buffer?.initialize(repeating: 0, count: Int(count))
+            return count
+        }
+
+        func seek(offset: Int64, whence: Int32) -> Int64 {
+            state.withLock {
+                if whence == 65536 { return length }
+                let next = offset + (whence == SEEK_CUR ? $0.cursor : whence == SEEK_END ? length : 0)
+                guard (0...length).contains(next) else { return -1 }
+                $0.cursor = next
+                return next
+            }
+        }
+
+        func close() {}
+        func makeIndependentReader() -> IOReader? { CountingCellReader() }
+    }
+
+    @Test func tenMinuteSeekLandsAtTheAlignedByteOffsetWithoutATimeMap() {
+        let base = CountingCellReader()
+        let reader = DVDTitleIOReader(base: base, cells: [
+            .init(byteStart: 0, byteLength: base.length, startSeconds: 0,
+                  durationSeconds: 2400, sourceStartSeconds: 100)
+        ], duration: 2400)
+        #expect(reader.seek(to: 600))
+        let target = base.length / 4
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == target)
+        #expect(base.state.withLock { $0.bytesRead } == 0)
+        #expect(reader.timestampShift(at: target) == 100)
+    }
+
+    @Test(arguments: [false, true])
+    func missingCellTimeMapUsesTheProportionalLanding(mapInOtherCell: Bool) {
+        let base = CountingCellReader()
+        let cellLength = base.length / 2
+        let reader = DVDTitleIOReader(base: base, cells: [
+            .init(byteStart: 0, byteLength: cellLength, startSeconds: 0,
+                  durationSeconds: 1200, sourceStartSeconds: 100),
+            .init(byteStart: cellLength, byteLength: cellLength, startSeconds: 1200,
+                  durationSeconds: 1200, sourceStartSeconds: 1300)
+        ], duration: 2400, timeMap: mapInOtherCell ? [.init(seconds: 10, byteOffset: 2048)] : [])
+        #expect(reader.seek(to: 1800))
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == cellLength + cellLength / 2)
+        #expect(base.state.withLock { $0.bytesRead } == 0)
+    }
+
+    @Test func syntheticTimeMapSeeksBeforeTheTargetDespiteVariableBitrate() throws {
+        var ifo = [UInt8](repeating: 0, count: 4096)
+        ifo.replaceSubrange(0..<12, with: DVDVTSI.magic)
+        func put32(_ offset: Int, _ value: UInt32) {
+            for byte in 0..<4 { ifo[offset + byte] = UInt8(truncatingIfNeeded: value >> (24 - byte * 8)) }
+        }
+        put32(0xD4, 1)
+        ifo[2049] = 1
+        put32(2052, 23)
+        put32(2056, 12)
+        ifo[2060] = 10
+        ifo[2063] = 2
+        put32(2064, 100)
+        put32(2068, 0x8000_0384) // Discontinuous VOBU at sector 900, not a proportional landing.
+        let parsed = try #require(DVDVTSI.parse(ifo))
+        let map = try #require(parsed.titleTimeMaps.first)
+        #expect(map.intervalSeconds == 10)
+        let base = CountingCellReader()
+        let points = map.entries.enumerated().map { index, sector in
+            DVDTitleIOReader.SeekPoint(seconds: Double(index + 1) * Double(map.intervalSeconds),
+                                       byteOffset: Int64(sector & 0x7FFF_FFFF) * 2048)
+        }
+        let reader = DVDTitleIOReader(base: base, cells: [
+            .init(byteStart: 0, byteLength: base.length, startSeconds: 0,
+                  durationSeconds: 2400, sourceStartSeconds: 100)
+        ], duration: 2400, timeMap: points)
+        for (seconds, sector) in [(9.0, 0), (10, 100), (19, 100), (20, 900), (29, 900)] {
+            #expect(reader.seek(to: seconds))
+            #expect(reader.seek(offset: 0, whence: SEEK_CUR) == Int64(sector) * 2048)
+        }
+        #expect(base.state.withLock { $0.bytesRead } == 0)
+        put32(2052, 19) // A truncated entry cannot be read from the next IFO table.
+        #expect(DVDVTSI.parse(ifo)?.titleTimeMaps == [DVDTimeMap(intervalSeconds: 0, entries: [])])
+    }
+
+    @Test(arguments: ["zeroInterval", "invalidOffset", "truncatedEntries"])
+    func malformedTimeMapPreservesOtherPGCMaps(damage: String) {
+        var bytes = [UInt8](repeating: 0, count: 44)
+        func put32(_ offset: Int, _ value: UInt32) {
+            for byte in 0..<4 { bytes[offset + byte] = UInt8(truncatingIfNeeded: value >> (24 - byte * 8)) }
+        }
+        bytes[1] = 3
+        put32(4, 43)
+        for (index, offset) in [20, 28, 36].enumerated() {
+            put32(8 + index * 4, UInt32(offset))
+            bytes[offset] = 10
+            bytes[offset + 3] = 1
+            put32(offset + 4, UInt32(100 * (index + 1)))
+        }
+        switch damage {
+        case "zeroInterval":
+            bytes[28] = 0
+            bytes[31] = 0
+        case "invalidOffset":
+            put32(12, 44)
+        default:
+            bytes[31] = 4
+        }
+        let maps = DVDTimeMap.parseTable(DVDBytes(bytes), at: 0)
+        #expect(maps == [DVDTimeMap(intervalSeconds: 10, entries: [100]),
+                         DVDTimeMap(intervalSeconds: 0, entries: []),
+                         DVDTimeMap(intervalSeconds: 10, entries: [300])])
+    }
+
+    @Test func navShiftsResolveOnFirstUseAndCacheDamagedCells() throws {
+        let base = CountingCellReader()
+        let resolved = OSAllocatedUnfairLock(initialState: [Int]())
+        let reader = DVDTitleIOReader(base: base, cells: [
+            .init(byteStart: 0, byteLength: 4096, startSeconds: 0, durationSeconds: 10, sourceStartSeconds: nil),
+            .init(byteStart: 4096, byteLength: 4096, startSeconds: 10, durationSeconds: 10, sourceStartSeconds: nil),
+            .init(byteStart: 8192, byteLength: 4096, startSeconds: 20, durationSeconds: 10, sourceStartSeconds: nil)
+        ], duration: 30) { index in
+            resolved.withLock { $0.append(index) }
+            return index == 0 ? 100 : index == 1 ? 2 : nil
+        }
+        #expect(reader.timestampShift(at: 0) == 100)
+        #expect(resolved.withLock { $0 } == [0])
+        #expect(reader.seek(to: 10))
+        #expect(reader.timestampShift(at: 4096) == -8)
+        #expect(reader.timestampShift(at: 8192) == -8)
+        #expect(reader.timestampShift(at: 8192) == -8)
+        #expect(resolved.withLock { $0 } == [0, 1, 2])
+        let fork = try #require(reader.makeIndependentReader() as? DVDTitleIOReader)
+        #expect(fork.timestampShift(at: 0) == 100)
+        #expect(fork.timestampShift(at: 4096) == -8)
+        #expect(fork.timestampShift(at: 8192) == -8)
+        #expect(resolved.withLock { $0 } == [0, 1, 2])
+    }
+
+    @Test func sectorSeekAndDiscontinuousCellClock() throws {
+        let base = try #require(FileIOReader(url: DVDMenuPlayerTests.fixture("menu-test.iso")))
+        let reader = DVDTitleIOReader(base: base,
+            cells: [
+                .init(byteStart: 0, byteLength: 4096, startSeconds: 0, durationSeconds: 10, sourceStartSeconds: 100),
+                .init(byteStart: 4096, byteLength: 4096, startSeconds: 10, durationSeconds: 10, sourceStartSeconds: 2)
+            ], duration: 20)
+        #expect(reader.seek(to: 12))
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == 4096)
+        #expect(reader.timestampShift(at: 4096) == -8)
+        #expect(2 - reader.timestampShift(at: 4096) == 10)
+        #expect(reader.seek(to: 3))
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == 0)
+        let fork = try #require(reader.makeIndependentReader() as? DVDTitleIOReader)
+        #expect(fork.seek(to: 12))
+        #expect(fork.seek(offset: 0, whence: SEEK_CUR) == 4096)
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == 0)
+    }
+
+    @Test func demuxerChapterEntryStartsAtTheCellSector() throws {
+        let harness = try DVDMenuPlayerTests.Harness("menu-test.iso", titleMode: .external)
+        harness.player.start(skipToMainTitle: true)
+        let request = try #require(harness.titleRequests.first)
+        let disc = harness.player.disc
+        let pgc = try #require(disc.navigation.titleSets[1]?.titlePGCs.first?.pgc)
+        let reader = try #require(disc.makeTitleReader(request))
+        let demuxer = Demuxer()
+        defer { demuxer.close() }
+        try demuxer.open(reader: reader, formatHint: "mpeg")
+        #expect(demuxer.seek(to: request.cellStartSeconds[1]))
+        let cellOne = pgc.cells[0]
+        let cellTwoByteStart = Int64(cellOne.lastVOBUEnd - cellOne.firstVOBUStart + 1) * 2048
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == cellTwoByteStart)
+        let video = demuxer.videoStreamIndex
+        try #require(video >= 0)
+        var firstPacketPosition: Int64?
+        var firstVideoSeconds: Double?
+        while let packet = try demuxer.readPacket() {
+            var owned = Optional(packet)
+            defer { trackedPacketFree(&owned) }
+            if firstPacketPosition == nil { firstPacketPosition = packet.pointee.pos }
+            if packet.pointee.stream_index == video,
+               let stream = demuxer.stream(at: video) {
+                let tb = stream.pointee.time_base
+                firstVideoSeconds = Double(packet.pointee.pts) * Double(tb.num) / Double(tb.den)
+                break
+            }
+        }
+        let position = try #require(firstPacketPosition)
+        let cellTwo = pgc.cells[1]
+        let cellTwoByteEnd = cellTwoByteStart + Int64(cellTwo.lastVOBUEnd - cellTwo.firstVOBUStart + 1) * 2048
+        #expect(position >= cellTwoByteStart)
+        #expect(position < cellTwoByteEnd)
+        #expect(abs(try #require(firstVideoSeconds) - request.cellStartSeconds[1]) < 0.1)
+    }
+
+    @Test(arguments: [0, 1]) func damagedCellNAVKeepsTheTitleReadable(cellIndex: Int) throws {
+        let harness = try DVDMenuPlayerTests.Harness("menu-test.iso", titleMode: .external)
+        harness.player.start(skipToMainTitle: true)
+        let request = try #require(harness.titleRequests.first)
+        let disc = harness.player.disc
+        let pgc = try #require(disc.navigation.titleSets[1]?.titlePGCs.first?.pgc)
+        let layout = try #require(disc.layout(.title(vts: 1)))
+        let cell = pgc.cells[cellIndex]
+        let extent = try #require(layout.byteExtents(sectors: cell.firstVOBUStart..<(cell.firstVOBUStart + 1)).first)
+        var bytes = try Data(contentsOf: DVDMenuPlayerTests.fixture("menu-test.iso"))
+        bytes.replaceSubrange(Int(extent.offset)..<(Int(extent.offset) + 2048), with: repeatElement(UInt8(0), count: 2048))
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".iso")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try bytes.write(to: url)
+        let damaged = try DVDDiscSource(url: url)
+        let reader = try #require(damaged.makeTitleReader(request) as? DVDTitleIOReader)
+        defer { reader.close(); damaged.reader.close() }
+        let byteStart = pgc.cells.prefix(cellIndex).reduce(Int64(0)) {
+            $0 + Int64($1.lastVOBUEnd - $1.firstVOBUStart + 1) * 2048
+        }
+        #expect(reader.seek(to: request.cellStartSeconds[cellIndex]))
+        #expect(reader.seek(offset: 0, whence: SEEK_CUR) == byteStart)
+        let expectedShift = cellIndex == 0 ? 0 : reader.timestampShift(at: 0)
+        #expect(abs(reader.timestampShift(at: byteStart) - expectedShift) < 0.000001)
     }
 
     @Test func walkCellFollowsNavPacks() throws {

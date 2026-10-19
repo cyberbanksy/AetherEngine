@@ -178,9 +178,7 @@ enum DiscReader {
             let ifoBytes = readAll(reader, [(offset: Int64(ifoFile.startSector * iso.sectorSize),
                                              length: Int64(ifoFile.length))])
             if let ifoTitles = DVDIFOParser.parseTitles(ifoBytes) {
-                let titleVTSNs = Set(ifoTitles.map(\.vtsn))
-                let filtered = groups.filter { titleVTSNs.contains($0.vtsn) }
-                if !filtered.isEmpty { orderedGroups = filtered }
+                orderedGroups = DVDTitleSelector.orderedTitleVOBGroups(files, titleSets: Set(ifoTitles.map(\.vtsn)))
             }
         }
         let selectedIndex = selectTitleID.flatMap { orderedGroups.indices.contains($0) ? $0 : nil } ?? 0
