@@ -301,8 +301,10 @@ struct DVDSubpictureScanner: Sendable {
                 var pts: Double?
                 if flags & 0x80 != 0, hdrLen >= 5 {
                     let p = i + 9
-                    let v = (Int64(bytes[p] >> 1) & 0x07) << 30 | Int64(bytes[p + 1]) << 22 |
-                        (Int64(bytes[p + 2]) >> 1) << 15 | Int64(bytes[p + 3]) << 7 | Int64(bytes[p + 4]) >> 1
+                    let high: Int64 = (Int64(bytes[p] >> 1) & 0x07) << 30
+                    let middle: Int64 = Int64(bytes[p + 1]) << 22 | (Int64(bytes[p + 2]) >> 1) << 15
+                    let low: Int64 = Int64(bytes[p + 3]) << 7 | Int64(bytes[p + 4]) >> 1
+                    let v = high | middle | low
                     pts = Double(v) / 90000
                 }
                 let stream = Int(sub & 0x1F)
